@@ -58,3 +58,5 @@ websockets>=15.0.1
 
 sentence-transformers>=2.5.1
 huggingface_hub>=0.20.0
+
+email-validator
