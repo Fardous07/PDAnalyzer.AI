@@ -1,62 +1,45 @@
-# Core
+
+# --- Core API ---
 fastapi>=0.110.0,<0.111.0
 pydantic>=2.12.0,<3.0.0
 uvicorn[standard]>=0.24.0
 
-# Database
-SQLAlchemy>=2.0.29,<2.1.0
-psycopg2-binary>=2.9.9
-
-# Config
-python-dotenv>=1.0.1
-pydantic-settings>=2.10.1,<3.0.0  
-
-# Auth
+# --- Auth / security
 python-jose[cryptography]>=3.3.0
 passlib>=1.7.4
+email-validator
 
-# File handling
+# --- File uploads ---
 aiofiles>=23.2.1
 python-multipart>=0.0.20
 
-# LLM
+# --- OpenAI client (Whisper API, embeddings, etc.) ---
 openai>=1.6.1
-groq>=0.30.0
 
-# LangChain - Let it manage sub-dependencies
+# --- Documents 
+PyPDF2>=3.0.1
+python-docx>=1.1.0
+
+# --- Audio/Video helpers for transcription (PyDub) ---
+pydub>=0.25.1
+# FFmpeg helpers: binary + Python wrapper
+imageio-ffmpeg>=0.4.9
+ffmpeg-python>=0.2.0
+
+# --- Optional LLM / LangChain 
+groq>=0.30.0
 langchain>=1.0.5,<2.0.0
 langchain-core>=1.0.4,<2.0.0
 langchain-community>=0.4.1,<1.0.0
 langchain-openai>=1.0.2,<2.0.0
 langchain-groq>=1.0.0,<2.0.0
 
-# Embeddings
-chromadb>=0.5.3,<0.6.0
-sentence-transformers>=2.2.2
 
-# Audio
-openai-whisper>=20231117
-
-# Documents
-pymupdf>=1.23.5
-pypdf2>=3.0.1
-docx2txt>=0.8
-python-pptx>=0.6.23
-
-# ML
 torch>=2.2.2
-scikit-learn>=1.4.2
-scipy>=1.11.4
+sentence-transformers>=2.5.1
 
-# Utils
-pandas>=2.2.2
-openpyxl>=3.1.5
+
 pillow>=10.4.0
 markdown>=3.6
 chardet>=5.2.0
 websockets>=15.0.1
-
-sentence-transformers>=2.5.1
-huggingface_hub>=0.20.0
-
-email-validator
