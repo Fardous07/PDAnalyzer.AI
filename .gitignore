@@ -1,0 +1,46 @@
+# =========================
+# GLOBAL
+# =========================
+.DS_Store
+Thumbs.db
+*.log
+
+.vscode/
+.idea/
+*.iml
+
+# =========================
+# PYTHON / FASTAPI (backend)
+# =========================
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# Secrets
+backend/.env
+.env
+
+# Local/old sqlite artifacts
+backend/*.db
+backend/speech_analysis.db
+
+# Logs
+backend/app.log
+backend/logs/
+
+# Generated / large / private content
+backend/media/uploads/
+backend/uploads/
+backend/chroma_db/
+
+# =========================
+# FRONTEND (React / Vite)
+# =========================
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Frontend env files (if you create them)
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local

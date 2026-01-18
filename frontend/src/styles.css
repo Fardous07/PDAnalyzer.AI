@@ -1,0 +1,26 @@
+/* frontend/src/styles.css */
+
+/* Tailwind v4 entry */
+@import "tailwindcss";
+
+/* Global tweaks – use plain CSS instead of @apply to avoid errors */
+body {
+  background-color: #f3f4f6; /* Tailwind bg-gray-100 */
+  color: #111827;            /* Tailwind text-gray-900 */
+}
+
+/* Simple fade-in animation for cards */
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 8px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+.animate-fade-in {
+  animation: fadeInUp 0.25s ease-out both;
+}
