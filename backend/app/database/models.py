@@ -1,19 +1,3 @@
-# backend/app/database/models.py
-"""
-DATABASE MODELS — SQLAlchemy ORM Models (PostgreSQL-ready)
-=========================================================
-
-Policy (Centrist-only; Neutral removed):
-- "Centrist" is the ONLY non-ideological family label.
-- Centrist has NO subtype (ideology_subtype must be NULL when ideology_family == "Centrist").
-- Persistence schema stores centrist_score (not neutral_score).
-
-Notes:
-- This file is ORM-only (SQLAlchemy). Pydantic v2 compatibility is handled in your schemas layer,
-  not in SQLAlchemy models.
-- Works with SQLite and PostgreSQL (JSON uses JSONB on PostgreSQL).
-"""
-
 from __future__ import annotations
 
 from datetime import datetime
@@ -35,21 +19,13 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.mutable import MutableDict
+from sqlalchemy.ext.mutable import MutableDict, MutableList
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
 
-# ---------------------------------------------------------------------------
-# JSON types
-# ---------------------------------------------------------------------------
 JSONDictType = MutableDict.as_mutable(JSON().with_variant(JSONB, "postgresql"))
-JSONListType = JSON().with_variant(JSONB, "postgresql")
-
-
-# =============================================================================
-# MANY-TO-MANY ASSOCIATION TABLES
-# =============================================================================
+JSONListType = MutableList.as_mutable(JSON().with_variant(JSONB, "postgresql"))
 
 speech_project_association = Table(
     "speech_project_association",
@@ -57,66 +33,44 @@ speech_project_association = Table(
     Column("speech_id", Integer, ForeignKey("speeches.id", ondelete="CASCADE"), primary_key=True),
     Column("project_id", Integer, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True),
     Column("added_at", DateTime, default=datetime.utcnow, nullable=False),
-    Column("order", Integer, default=0, nullable=False),
+    Column("sort_order", Integer, default=0, nullable=False),
 )
 
-
-# =============================================================================
-# USER MODEL
-# =============================================================================
 
 class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
-
-    # Authentication
     email = Column(String(255), unique=True, index=True, nullable=False)
     hashed_password = Column(String(255), nullable=False)
     username = Column(String(100), unique=True, index=True, nullable=True)
 
-    # Profile
     full_name = Column(String(200), nullable=True)
     organization = Column(String(200), nullable=True)
     bio = Column(Text, nullable=True)
 
-    # Preferences
-    preferences = Column(
-        JSONDictType,
-        nullable=False,
-        default=dict,
-        comment="User preferences: theme, default_llm, etc.",
-    )
+    preferences = Column(JSONDictType, nullable=False, default=dict)
 
-    # Status
     is_active = Column(Boolean, default=True, nullable=False)
     is_verified = Column(Boolean, default=False, nullable=False)
 
-    # Admin/role
     is_admin = Column(Boolean, default=False, nullable=False)
     role = Column(String(50), default="user", nullable=False)
 
-    # Subscription / quotas
     subscription_tier = Column(String(50), default="free", nullable=False)
     max_speeches = Column(Integer, default=50, nullable=False)
     max_file_size = Column(Integer, default=100_000_000, nullable=False)
 
-    # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     last_login = Column(DateTime, nullable=True)
 
-    # Relationships
     speeches = relationship("Speech", back_populates="user", cascade="all, delete-orphan")
     projects = relationship("Project", back_populates="user", cascade="all, delete-orphan")
 
     def __repr__(self) -> str:
         return f"<User(id={self.id}, email='{self.email}')>"
 
-
-# =============================================================================
-# SPEECH MODEL
-# =============================================================================
 
 class Speech(Base):
     __tablename__ = "speeches"
@@ -125,40 +79,33 @@ class Speech(Base):
 
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
 
-    # Metadata
     title = Column(String(500), nullable=False, index=True)
     speaker = Column(String(200), nullable=False, index=True)
     date = Column(DateTime, nullable=True, index=True)
     location = Column(String(200), nullable=True)
     event = Column(String(200), nullable=True)
 
-    # Content
-    text = Column(Text, nullable=False, comment="Full speech text")
+    text = Column(Text, nullable=False)
     language = Column(String(10), default="en", nullable=False)
     word_count = Column(Integer, nullable=True)
 
-    # Source / media
     source_url = Column(String(500), nullable=True)
-    source_type = Column(String(50), nullable=True, comment="transcript, video, article, etc.")
-    media_url = Column(String(500), nullable=True, comment="Path to uploaded media file")
+    source_type = Column(String(50), nullable=True)
+    media_url = Column(String(500), nullable=True)
 
-    # Analysis configuration stored for traceability
-    llm_provider = Column(String(50), nullable=True, comment="openai, anthropic, groq")
-    llm_model = Column(String(100), nullable=True, comment="gpt-4o-mini, claude-3-5-sonnet, etc.")
+    llm_provider = Column(String(50), nullable=True)
+    llm_model = Column(String(100), nullable=True)
 
-    # UI settings
     use_semantic_segmentation = Column(Boolean, default=True, nullable=False)
     use_semantic_scoring = Column(Boolean, default=True, nullable=False)
 
-    # Status
-    status = Column(String(20), default="pending", nullable=False, comment="pending, processing, completed, failed")
+    status = Column(String(20), default="pending", nullable=False)
     is_public = Column(Boolean, default=False, nullable=False)
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     analyzed_at = Column(DateTime, nullable=True)
 
-    # Relationships
     user = relationship("User", back_populates="speeches")
     analysis = relationship("Analysis", back_populates="speech", uselist=False, cascade="all, delete-orphan")
     questions = relationship("Question", back_populates="speech", cascade="all, delete-orphan")
@@ -173,21 +120,7 @@ class Speech(Base):
         return f"<Speech(id={self.id}, title='{self.title}', speaker='{self.speaker}')>"
 
 
-# =============================================================================
-# ANALYSIS MODEL
-# =============================================================================
-
 class Analysis(Base):
-    """
-    Stores the COMPLETE output from services/speech_ingestion.py (ingest_speech)
-    in full_results.
-
-    Policy:
-    - "Centrist" is non-ideological.
-    - ideology_subtype MUST be NULL when ideology_family == 'Centrist'.
-    - Uses centrist_score (not neutral_score).
-    """
-
     __tablename__ = "analyses"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -200,31 +133,18 @@ class Analysis(Base):
         index=True,
     )
 
-    # Quick query fields
     ideology_family = Column(String(50), nullable=False, index=True)
     ideology_subtype = Column(String(100), nullable=True, index=True)
 
-    libertarian_score = Column(Float, nullable=False, default=0.0, comment="Percentage 0-100")
-    authoritarian_score = Column(Float, nullable=False, default=0.0, comment="Percentage 0-100")
-    centrist_score = Column(Float, nullable=False, default=0.0, comment="Percentage 0-100")
+    libertarian_score = Column(Float, nullable=False, default=0.0)
+    authoritarian_score = Column(Float, nullable=False, default=0.0)
+    centrist_score = Column(Float, nullable=False, default=0.0)
 
-    confidence_score = Column(Float, nullable=False, default=0.0, comment="0.0-1.0")
+    confidence_score = Column(Float, nullable=False, default=0.0)
 
-    marpor_codes = Column(
-        JSONListType,
-        nullable=False,
-        default=list,
-        comment="List of detected MARPOR codes",
-    )
+    marpor_codes = Column(JSONListType, nullable=False, default=list)
+    full_results = Column(JSONDictType, nullable=False, default=dict)
 
-    full_results = Column(
-        JSONDictType,
-        nullable=False,
-        default=dict,
-        comment="Complete analysis results JSON from ingest_speech()",
-    )
-
-    # Metrics
     processing_time_seconds = Column(Float, nullable=True)
     segment_count = Column(Integer, nullable=True)
     siu_count = Column(Integer, nullable=True)
@@ -233,7 +153,6 @@ class Analysis(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
-    # Relationships
     speech = relationship("Speech", back_populates="analysis")
     history = relationship("AnalysisHistory", back_populates="analysis", cascade="all, delete-orphan")
 
@@ -245,7 +164,6 @@ class Analysis(Base):
         CheckConstraint("authoritarian_score >= 0 AND authoritarian_score <= 100", name="check_auth_score"),
         CheckConstraint("centrist_score >= 0 AND centrist_score <= 100", name="check_centrist_score"),
         CheckConstraint("confidence_score >= 0 AND confidence_score <= 1", name="check_confidence"),
-        # Enforce "Centrist has no subtype" at DB constraint level.
         CheckConstraint(
             "(ideology_family <> 'Centrist') OR (ideology_subtype IS NULL)",
             name="check_centrist_no_subtype",
@@ -255,7 +173,6 @@ class Analysis(Base):
     def __repr__(self) -> str:
         return f"<Analysis(id={self.id}, speech_id={self.speech_id}, ideology={self.ideology_family})>"
 
-    # Convenience getters (safe)
     def get_speech_level(self) -> Dict[str, Any]:
         return (self.full_results or {}).get("speech_level", {}) if isinstance(self.full_results, dict) else {}
 
@@ -274,10 +191,6 @@ class Analysis(Base):
         return secs if isinstance(secs, list) else []
 
 
-# =============================================================================
-# QUESTION MODEL
-# =============================================================================
-
 class Question(Base):
     __tablename__ = "questions"
 
@@ -286,7 +199,7 @@ class Question(Base):
     speech_id = Column(Integer, ForeignKey("speeches.id", ondelete="CASCADE"), nullable=False, index=True)
 
     question_text = Column(Text, nullable=False)
-    question_type = Column(String(20), nullable=False, comment="journalistic or technical")
+    question_type = Column(String(20), nullable=False)
     question_order = Column(Integer, default=0, nullable=False)
 
     generated_by_llm = Column(String(100), nullable=True)
@@ -307,10 +220,6 @@ class Question(Base):
     def __repr__(self) -> str:
         return f"<Question(id={self.id}, speech_id={self.speech_id}, type='{self.question_type}')>"
 
-
-# =============================================================================
-# PROJECT MODEL
-# =============================================================================
 
 class Project(Base):
     __tablename__ = "projects"
@@ -346,10 +255,6 @@ class Project(Base):
         return f"<Project(id={self.id}, name='{self.name}', speech_count={self.speech_count})>"
 
 
-# =============================================================================
-# ANALYSIS HISTORY (AUDIT TRAIL)
-# =============================================================================
-
 class AnalysisHistory(Base):
     __tablename__ = "analysis_history"
 
@@ -381,7 +286,6 @@ class AnalysisHistory(Base):
         CheckConstraint("authoritarian_score >= 0 AND authoritarian_score <= 100", name="check_history_auth_score"),
         CheckConstraint("centrist_score >= 0 AND centrist_score <= 100", name="check_history_centrist_score"),
         CheckConstraint("confidence_score >= 0 AND confidence_score <= 1", name="check_history_confidence"),
-        # Enforce "Centrist has no subtype"
         CheckConstraint(
             "(ideology_family <> 'Centrist') OR (ideology_subtype IS NULL)",
             name="check_history_centrist_no_subtype",
@@ -391,10 +295,6 @@ class AnalysisHistory(Base):
     def __repr__(self) -> str:
         return f"<AnalysisHistory(id={self.id}, analysis_id={self.analysis_id}, date={self.created_at})>"
 
-
-# =============================================================================
-# HELPERS
-# =============================================================================
 
 def create_all_tables(engine) -> None:
     Base.metadata.create_all(bind=engine)

@@ -1,138 +1,149 @@
-"""
-backend/app/services/marpor_definitions.py
-
-RESEARCH-GRADE MARPOR DEFINITIONS + EVIDENCE GATE (STRICT, NO FALLBACK)
-======================================================================
-
-Design goals (aligned with your discourse ingestion rules):
-1) Only sentences that MATCH MARPOR (lexical/semantic) can be evidence.
-2) No fallback that marks all sentences as evidence.
-3) Evidence gate is consistent and stable:
-   - evidence_count is derived from VALIDATED MARPOR evidence hits
-   - is_ideology_evidence is True only when the IDEOLOGICAL gate passes
-4) Polarity affects ideological direction (support/oppose), but does not erase evidence existence.
-
-Key policy for DISCOURSE (updated):
-- "Neutral" is REMOVED.
-- "Centrist" is the only non-ideological family label.
-- Centrist has NO subtype.
-- Centrist discourse categories (CENT/BI/REF) can exist as non-ideological evidence but do NOT
-  count toward ideological evidence_count / ideological gate.
-
-How do we decide Centrist vs Ideological?
-- A sentence is CENTRIST if it has:
-  (a) no validated ideological evidence, OR
-  (b) ideological evidence exists but fails the ideological evidence gate, OR
-  (c) only centrist-discourse evidence exists (CENT/BI/REF).
-
-Outputs expected by downstream (ideology_scoring + speech_ingestion):
-- ideology_family: "Libertarian" | "Authoritarian" | "Centrist"
-- ideology_subtype: subtype str for Lib/Auth; None for Centrist
-- evidence: list[...] (IDEOLOGICAL validated hits only; includes negative/neutral polarity)
-- evidence_count (ideological validated hits)
-- support_evidence_count (ideological validated hits with polarity > 0)
-- marpor_codes (ideological codes only)
-- is_ideology_evidence (True only if ideological gate passes)
-- confidence_score (0..1)
-- signal_strength (0..100) based on ideological total strength
-
-Additional helpful outputs:
-- centrist_evidence / centrist_evidence_count / centrist_marpor_codes (diagnostic only)
-- scores: Libertarian/Authoritarian/Centrist percent share by strength
-- marpor_breakdown / marpor_code_analysis (derived from validated evidence; no new evidence created)
-  * marpor_breakdown: ideological only
-  * centrist_marpor_breakdown: centrist only
-"""
+# backend/app/services/marpor_definitions.py
 
 from __future__ import annotations
 
-import re
-import math
 import logging
-from dataclasses import dataclass, field
-from typing import Any, DefaultDict, Dict, List, Optional, Tuple
+import math
+import re
 from collections import defaultdict
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, DefaultDict, Dict, List, Optional, Tuple
 
 import numpy as np
+from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# SCIENTIFIC CONFIGURATION (UNIFIED GATE + SEMANTIC CONTROLS)
-# =============================================================================
-
 LIB_FAMILY = "Libertarian"
 AUTH_FAMILY = "Authoritarian"
+ECON_LEFT = "Economic-Left"
+ECON_RIGHT = "Economic-Right"
 CENTRIST_FAMILY = "Centrist"
 
-# ---- IDEOLOGICAL evidence gate (Centrist never passes) ----
 EVIDENCE_MIN_EVIDENCE_COUNT = 1
 EVIDENCE_MIN_TOPIC_COUNT = 1
 EVIDENCE_MIN_TOTAL_STRENGTH = 0.20
-EVIDENCE_MIN_DOMINANCE = 0.35  # dominance computed over Lib/Auth only
+EVIDENCE_MIN_AXIS_DOMINANCE = 0.35
 
-# Evidence pruning
 MIN_EVIDENCE_STRENGTH_KEEP = 0.20
 
-# ---- Semantic thresholds ----
+AXIS_ATTR_SUPPORT_MULT = 1.0
+AXIS_ATTR_NEUTRAL_MULT = 0.6
+AXIS_ATTR_OPPOSE_MULT = 0.3
+
+AXIS_MIN_TOTAL = 0.15
+
 SEMANTIC_THRESHOLD = 0.70
 SEMANTIC_NEG_THRESHOLD = 0.80
 SEMANTIC_MARGIN = 0.06
 SEMANTIC_TOPK = 5
-SEMANTIC_LEXICAL_OVERRIDE = 0.75  # skip semantic if lexical already strong
+SEMANTIC_LEXICAL_OVERRIDE = 0.75
 
-# Evidence-level confidence tiers
 HIGH_CONFIDENCE_THRESHOLD = 0.85
 MEDIUM_CONFIDENCE_THRESHOLD = 0.70
 LOW_CONFIDENCE_THRESHOLD = 0.55
 
-
-# =============================================================================
-# IDEOLOGY SUBTYPE MAPPING (IDEOLOGICAL ONLY; Centrist has no subtype)
-# =============================================================================
-
 IDEOLOGY_SUBTYPES: Dict[str, List[str]] = {
-    # Libertarian subtypes
     "Right-Libertarianism": ["401", "407", "414", "505", "702", "301", "507"],
     "Left-Libertarianism": ["201", "203", "SJ", "604", "607", "503", "501"],
     "Cultural Libertarianism": ["201", "604", "607", "503"],
     "Geo-Libertarianism": ["501", "401", "407", "301"],
     "Paleo-Libertarianism": ["401", "414", "505", "603", "601", "702"],
-
-    # Authoritarian subtypes
     "Right-Authoritarian": ["305", "605", "603", "601", "608", "302", "PROT", "POP"],
     "Left-Authoritarian": ["404", "412", "413", "504", "701", "ENV_AUTH", "SJ"],
 }
 
 
-# =============================================================================
-# EVIDENCE WEIGHTING SYSTEM
-# =============================================================================
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def _dominance(a: float, b: float) -> float:
+    tot = a + b
+    return (max(a, b) / tot) if tot > 0 else 0.0
+
+
+def _axis_pol_mult(polarity: int) -> float:
+    if polarity > 0:
+        return AXIS_ATTR_SUPPORT_MULT
+    if polarity < 0:
+        return AXIS_ATTR_OPPOSE_MULT
+    return AXIS_ATTR_NEUTRAL_MULT
+
+
+def _axis_confidence(pos_mass: float, neg_mass: float) -> float:
+    tot = pos_mass + neg_mass
+    if tot <= 0:
+        return 0.0
+    dom = _dominance(pos_mass, neg_mass)
+    mass_term = _clamp(tot / 2.0, 0.0, 1.0)
+    return float(_clamp(mass_term * dom, 0.0, 1.0))
+
+
+def _coord_from_masses(pos_mass: float, neg_mass: float) -> float:
+    tot = pos_mass + neg_mass
+    if tot <= 0:
+        return 0.0
+    return float((pos_mass - neg_mass) / tot)
+
+
+def _axis_labels_block() -> Dict[str, Any]:
+    return {
+        "x_axis": {"name": "Economic", "negative": "Left", "positive": "Right"},
+        "y_axis": {"name": "Social", "negative": "Authoritarian", "positive": "Libertarian"},
+    }
+
+
+def _axis_directions_from_masses(
+    *,
+    s_lib: float,
+    s_auth: float,
+    e_left: float,
+    e_right: float,
+    axis_min_total: float,
+) -> Dict[str, str]:
+    social_total = s_lib + s_auth
+    econ_total = e_left + e_right
+
+    social_dir = ""
+    if social_total >= axis_min_total:
+        social_dir = "Libertarian" if s_lib >= s_auth else "Authoritarian"
+
+    econ_dir = ""
+    if econ_total >= axis_min_total:
+        econ_dir = "Right" if e_right >= e_left else "Left"
+
+    return {"social": social_dir, "economic": econ_dir}
+
+
+def _threshold_scale(threshold: float) -> float:
+    t = float(threshold)
+    t = _clamp(t, 0.10, 0.95)
+    return float(_clamp(t / 0.60, 0.40, 1.60))
+
 
 class EvidenceWeight:
-    """Weighting for different evidence types / conditions."""
-
-    # Base weights
     LEXICAL_PRIMARY: float = 1.0
     LEXICAL_SECONDARY: float = 0.7
     SEMANTIC_DIRECT: float = 0.9
     SEMANTIC_PARAPHRASE: float = 0.75
     SEMANTIC_WEAK: float = 0.6
 
-    # Context modifiers
     CONTEXT_REQUIRED_MET: float = 1.1
     CONTEXT_REQUIRED_MISSED: float = 0.7
     CONTEXT_EXCLUDED_PRESENT: float = 0.3
     INSIDE_QUOTES: float = 0.6
     OUTSIDE_QUOTES: float = 1.0
 
-    # Polarity modifiers (affects evidence strength only; not existence)
     SUPPORT_STRENGTH: float = 1.0
     OPPOSE_STRENGTH: float = 0.5
-    CENTRIST_STRENGTH: float = 0.7
+    NEUTRAL_STRENGTH: float = 0.7
 
-    # Position modifiers
     OPENING_STATEMENT: float = 1.2
     CLOSING_STATEMENT: float = 1.15
     MIDDLE_STATEMENT: float = 1.0
@@ -165,10 +176,6 @@ class EvidenceWeight:
         return cls.MIDDLE_STATEMENT
 
 
-# =============================================================================
-# EVIDENCE-LEVEL CONFIDENCE
-# =============================================================================
-
 class EvidenceConfidence:
     @staticmethod
     def calculate_evidence_confidence(
@@ -197,7 +204,7 @@ class EvidenceConfidence:
         elif polarity < 0:
             polarity_factor = EvidenceWeight.OPPOSE_STRENGTH
         else:
-            polarity_factor = EvidenceWeight.CENTRIST_STRENGTH
+            polarity_factor = EvidenceWeight.NEUTRAL_STRENGTH
 
         semantic_boost = 1.0
         if match_type == "semantic" and similarity is not None:
@@ -229,18 +236,18 @@ class EvidenceConfidence:
             tier = "insufficient"
 
         return {
-            "evidence_confidence": round(evidence_conf, 4),
-            "base_quality": round(base_quality, 4),
-            "context_factor": round(context_factor, 4),
-            "quote_factor": quote_factor,
-            "polarity_factor": polarity_factor,
-            "position_modifier": round(position_modifier, 4),
-            "reliability_score": round(reliability, 4),
-            "error_margin": round(error_margin, 4),
+            "evidence_confidence": round(float(evidence_conf), 4),
+            "base_quality": round(float(base_quality), 4),
+            "context_factor": round(float(context_factor), 4),
+            "quote_factor": float(quote_factor),
+            "polarity_factor": float(polarity_factor),
+            "position_modifier": round(float(position_modifier), 4),
+            "reliability_score": round(float(reliability), 4),
+            "error_margin": round(float(error_margin), 4),
             "quality_tier": tier,
             "confidence_interval": (
-                round(max(0.0, evidence_conf - error_margin), 4),
-                round(min(1.0, evidence_conf + error_margin), 4),
+                round(float(max(0.0, evidence_conf - error_margin)), 4),
+                round(float(min(1.0, evidence_conf + error_margin)), 4),
             ),
         }
 
@@ -263,48 +270,35 @@ class EvidenceConfidence:
         pc = coverage * specificity
 
         return {
-            "pattern_coverage": round(coverage, 4),
-            "pattern_specificity": round(specificity, 4),
-            "pattern_confidence": round(pc, 4),
-            "codes_present": len(present),
-            "codes_expected": expected,
+            "pattern_coverage": round(float(coverage), 4),
+            "pattern_specificity": round(float(specificity), 4),
+            "pattern_confidence": round(float(pc), 4),
+            "codes_present": int(len(present)),
+            "codes_expected": int(expected),
         }
 
-
-# =============================================================================
-# DATA STRUCTURES
-# =============================================================================
 
 @dataclass
 class MarporCategory:
     code: str
     label: str
     description: str
-    tendency: str  # "libertarian" | "authoritarian" | "centrist"
+    tendency: str
     weight: float = 1.0
-
+    social_tendency: float = 0.0
+    economic_tendency: float = 0.0
+    social_weight: float = 0.0
+    economic_weight: float = 0.0
+    subtype_weights: Dict[str, float] = field(default_factory=dict)
     primary_keywords: List[str] = field(default_factory=list)
     secondary_keywords: List[str] = field(default_factory=list)
-
     semantic_positive: List[str] = field(default_factory=list)
     semantic_negative: List[str] = field(default_factory=list)
-
     requires_context: List[str] = field(default_factory=list)
     excludes_context: List[str] = field(default_factory=list)
     anti_patterns: List[str] = field(default_factory=list)
-
-    # Hard-context control: when True, lexical hits require >=1 context hit to be kept.
     requires_context_hard: bool = False
-
     subtype_group: str = "general"
-
-    @property
-    def ideology_family(self) -> str:
-        if self.tendency == "libertarian":
-            return LIB_FAMILY
-        if self.tendency == "authoritarian":
-            return AUTH_FAMILY
-        return CENTRIST_FAMILY
 
     def get_all_keywords(self) -> List[str]:
         return list(self.primary_keywords) + list(self.secondary_keywords)
@@ -315,54 +309,41 @@ class Evidence:
     code: str
     matched_text: str
     span: Tuple[int, int]
-    match_type: str  # "lexical_primary" | "lexical_secondary" | "semantic"
+    match_type: str
     base_strength: float
     strength: float
-    polarity: int  # +1 support, -1 oppose, 0 centrist/ambiguous
+    polarity: int
     polarity_reason: str
     inside_quotes: bool = False
     semantic_similarity: Optional[float] = None
     context_hits: List[str] = field(default_factory=list)
     context_misses: List[str] = field(default_factory=list)
     evidence_confidence: Dict[str, Any] = field(default_factory=dict)
+    attribution_hint: bool = False
+    attribution_reason: Optional[str] = None
 
-
-# =============================================================================
-# SEMANTIC SERVICE
-# =============================================================================
 
 class SemanticService:
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        self.model = None
-        try:
-            from sentence_transformers import SentenceTransformer  # type: ignore
-            self.model = SentenceTransformer(model_name)
-            logger.info("Loaded semantic model: %s", model_name)
-        except Exception as e:
-            logger.warning("Could not load sentence transformer (%s). Semantic matching disabled.", e)
-            self.model = None
+        self.model_name = model_name
+        self.model: Any = None
+
+    def ensure_loaded(self) -> None:
+        if self.model is not None:
+            return
+        self.model = SentenceTransformer(self.model_name)
 
     def encode_many(self, texts: List[str]) -> Optional[np.ndarray]:
+        self.ensure_loaded()
         if self.model is None or not texts:
             return None
-        try:
-            try:
-                emb = self.model.encode(
-                    texts,
-                    convert_to_numpy=True,
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                )
-                return np.asarray(emb, dtype=np.float32)
-            except TypeError:
-                emb = self.model.encode(texts, show_progress_bar=False)
-                emb = np.asarray(emb, dtype=np.float32)
-                norms = np.linalg.norm(emb, axis=1, keepdims=True)
-                norms = np.where(norms == 0.0, 1.0, norms)
-                return emb / norms
-        except Exception as e:
-            logger.warning("Semantic encode_many failed: %s", e)
-            return None
+        emb = self.model.encode(
+            texts,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return np.asarray(emb, dtype=np.float32)
 
     def encode_one(self, text: str) -> Optional[np.ndarray]:
         out = self.encode_many([text])
@@ -372,8 +353,9 @@ class SemanticService:
 
     @staticmethod
     def cosine_similarity_matrix(vec: np.ndarray, mat: np.ndarray) -> np.ndarray:
-        if vec is None or mat is None or mat.size == 0:
+        if vec is None or mat is None or getattr(mat, "size", 0) == 0:
             return np.zeros((0,), dtype=np.float32)
+
         v = vec.astype(np.float32)
         M = mat.astype(np.float32)
 
@@ -385,17 +367,22 @@ class SemanticService:
         return sims.astype(np.float32)
 
 
-# =============================================================================
-# MAIN ANALYZER
-# =============================================================================
-
 class HybridMarporAnalyzer:
-    """
-    Evidence-level analyzer:
-    - Lexical matching + selective semantic matching
-    - Context validation + polarity
-    - IDEOLOGICAL evidence gate (Centrist excluded from gate)
-    """
+    _CEREMONIAL_RE = re.compile(
+        r"^\s*(thank you|thanks|god bless|applause|welcome|good (morning|afternoon|evening)|"
+        r"ladies and gentlemen|my fellow|let me be clear|it is an honor)\b",
+        re.IGNORECASE,
+    )
+
+    _ACTION_MARKER_RE = re.compile(
+        r"\b("
+        r"will|must|should|need(?:s)?\s+to|have\s+to|going\s+to|plan\s+to|intend\s+to|"
+        r"ban|restrict|regulate|control|enforce|prosecute|punish|"
+        r"protect|defend|guarantee|secure|"
+        r"expand|strengthen|restore|repeal|pass|fund|invest|cut|raise"
+        r")\b",
+        re.IGNORECASE,
+    )
 
     def __init__(self, semantic_model: Optional[str] = "all-MiniLM-L6-v2"):
         self.categories: Dict[str, MarporCategory] = {}
@@ -409,10 +396,10 @@ class HybridMarporAnalyzer:
         self._sem_neg_emb: Dict[str, np.ndarray] = {}
         self._sem_pos_texts: Dict[str, List[str]] = {}
         self._sem_neg_texts: Dict[str, List[str]] = {}
+        self._semantic_ready: bool = False
 
         self._init_all_categories()
         self._compile_patterns()
-        self._precompute_semantic_embeddings()
 
         self.negation_patterns = [
             re.compile(r"\b(not|never|no|none|neither|nor|without)\b", re.IGNORECASE),
@@ -432,664 +419,857 @@ class HybridMarporAnalyzer:
             re.compile(r"\b(advocate|promote|champion|embrace)\b", re.IGNORECASE),
         ]
 
-        logger.info("Initialized HybridMarporAnalyzer with %d categories", len(self.categories))
+        self.attribution_patterns = [
+            re.compile(r"\baccording to\b", re.IGNORECASE),
+            re.compile(r"\bas (?:he|she|they)\s+(?:say|said|claim(?:ed)?|argue(?:d)?)\b", re.IGNORECASE),
+            re.compile(r"\bhe (?:says|said|claims|claimed)\b", re.IGNORECASE),
+            re.compile(r"\bshe (?:says|said|claims|claimed)\b", re.IGNORECASE),
+            re.compile(r"\bthey (?:say|said|claim|claimed)\b", re.IGNORECASE),
+            re.compile(r"\b(my opponent|our opponents|the opposition|the other side)\b", re.IGNORECASE),
+            re.compile(r"\b(experts? say|studies? show|research(?:ers)? find)\b", re.IGNORECASE),
+        ]
 
     def set_embedder(self, embedder: Any) -> None:
         if hasattr(embedder, "encode"):
             self.semantic.model = embedder
-            self._precompute_semantic_embeddings()
-            logger.info("External embedder set and semantic embeddings rebuilt.")
-
-    # -------------------------------------------------------------------------
-    # CATEGORY INITIALIZATION
-    # -------------------------------------------------------------------------
+            self._semantic_ready = False
 
     def _init_all_categories(self) -> None:
-        # ==================== LIBERTARIAN ====================
+        C = self.categories
 
-        self.categories["201"] = MarporCategory(
+        C["201"] = MarporCategory(
             code="201",
             label="Freedom and Human Rights",
-            description="Individual freedoms, civil liberties, human rights",
+            description="Civil liberties, human rights, free speech, individual freedom",
             tendency="libertarian",
             weight=1.0,
+            social_tendency=+0.90,
+            social_weight=1.0,
             primary_keywords=[
-                "freedom", "liberty", "civil liberties", "human rights", "free speech",
-                "individual rights", "personal freedom", "civil rights"
+                "civil liberties", "human rights", "free speech", "freedom of speech",
+                "civil rights", "individual rights", "freedom of expression",
+                "privacy rights", "freedom of assembly", "freedom of religion",
+                "freedom of the press", "press freedom", "free press",
+                "voting rights", "right to vote", "election access", "voter access",
+                "voter suppression", "protect the vote",
+                "reproductive freedom", "reproductive rights", "abortion rights",
+                "right to choose", "contraception", "birth control",
+                "ivf", "in vitro fertilization", "pre-existing conditions", "preexisting conditions",
             ],
             secondary_keywords=[
-                "choice", "consent", "agency", "sovereignty", "empowerment",
-                "autonomy", "self-determination", "free will"
+                "liberty", "freedom", "rights", "autonomy", "self-determination",
+                "due process rights", "bodily autonomy", "personal freedom",
+                "civil liberties protections", "first amendment", "constitutional rights",
+                "freedom to vote", "protect voting access",
+                "privacy", "data privacy", "right to privacy",
             ],
             semantic_positive=[
-                "We must protect individual freedoms and civil liberties.",
-                "Free speech is the foundation of a free society.",
-                "Privacy and civil rights must be safeguarded.",
-                "People should have the right to make their own choices.",
-                "Individual autonomy is essential for human dignity.",
-                "Personal freedom is a fundamental human right.",
-                "Civil liberties are the cornerstone of democracy."
+                "We must protect civil liberties and fundamental rights.",
+                "Free speech is essential in a democratic society.",
+                "Freedom of the press must be protected from intimidation or retaliation.",
+                "The state must not violate personal privacy without due process.",
+                "Voting rights must be protected so every eligible citizen can vote.",
+                "Reproductive freedom and bodily autonomy must be respected by the state.",
             ],
             semantic_negative=[
-                "We need to limit some freedoms for security.",
-                "Some rights must be restricted for the greater good.",
-                "Free speech can be dangerous and needs controls."
+                "Some freedoms must be restricted for security and order.",
+                "Free speech should be limited to prevent harmful ideas.",
+                "Rights can be suspended when the state deems it necessary.",
+                "News outlets that criticize leaders should face consequences.",
             ],
-            requires_context=[
-                "rights", "civil", "liberties", "speech", "amendment", "due process",
-                "privacy", "protect", "restrict", "petition", "assemble"
-            ],
-            excludes_context=["may god bless", "god bless", "applause", "thank you"],
-            requires_context_hard=True,
-        )
-
-        self.categories["203"] = MarporCategory(
-            code="203",
-            label="Constitutionalism and Rule of Law",
-            description="Rule of law, constitutional limits, due process, judicial independence",
-            tendency="libertarian",
-            weight=0.9,
-            primary_keywords=[
-                "rule of law", "constitution", "constitutional", "due process",
-                "checks and balances", "separation of powers", "judicial independence",
-                "constitutional rights", "legal protections"
-            ],
-            secondary_keywords=[
-                "accountability", "oversight", "transparency", "judicial review",
-                "constitutional limits", "legal framework", "procedural fairness"
-            ],
-            semantic_positive=[
-                "We must uphold constitutional limits on government power.",
-                "The rule of law must prevail over political expediency.",
-                "An independent judiciary protects our rights.",
-                "Due process ensures fairness for everyone.",
-                "Police must be held accountable through proper oversight.",
-                "Constitutional protections safeguard individual liberty.",
-                "Separation of powers prevents tyranny."
-            ],
-            semantic_negative=[
-                "We need strong police powers without interference.",
-                "Constitutional limits hinder effective governance.",
-                "Judicial independence is less important than security."
-            ],
-            requires_context=["oversight", "accountability", "reform", "transparency", "protect", "amendment", "rights", "due process"],
-            excludes_context=["crackdown", "zero tolerance", "strict enforcement", "war on"],
+            requires_context=["rights", "libert", "speech", "privacy", "due process", "civil", "freedom", "vote", "press"],
+            excludes_context=["applause", "thank you", "god bless", "welcome"],
             requires_context_hard=False,
         )
 
-        self.categories["301"] = MarporCategory(
+        C["203"] = MarporCategory(
+            code="203",
+            label="Constitutionalism and Rule of Law",
+            description="Rule of law, constitutional limits, checks and balances",
+            tendency="libertarian",
+            weight=0.9,
+            social_tendency=+0.75,
+            social_weight=1.0,
+            primary_keywords=[
+                "rule of law", "constitutional", "constitution",
+                "checks and balances", "separation of powers",
+                "judicial independence", "due process",
+                "constitutional limits", "legal safeguards",
+                "free and fair elections", "peaceful transfer of power",
+                "election integrity", "protect democracy", "democratic norms",
+                "john lewis voting rights act", "voting rights act", "freedom to vote act",
+            ],
+            secondary_keywords=[
+                "oversight", "accountability", "transparency",
+                "independent courts", "procedural fairness",
+                "anti-corruption", "government accountability", "constitutional order",
+            ],
+            semantic_positive=[
+                "The constitution limits state power and protects liberty.",
+                "No one is above the law; institutions must be accountable.",
+                "Courts must be independent from political interference.",
+                "Due process is required before depriving anyone of rights.",
+                "Checks and balances prevent abuse of executive power.",
+                "Free and fair elections and peaceful transfers of power must be protected.",
+            ],
+            semantic_negative=[
+                "Courts should not block decisive government action.",
+                "Legal constraints must not hinder public security measures.",
+                "Elections should be controlled to ensure the right outcomes.",
+            ],
+            requires_context=["law", "constitution", "court", "judicial", "due process", "oversight", "election"],
+            excludes_context=["applause", "thank you", "god bless"],
+        )
+
+        C["301"] = MarporCategory(
             code="301",
             label="Decentralization",
-            description="Power to local/regional levels, federalism, local control",
+            description="Devolution, federalism, local control, subsidiarity",
             tendency="libertarian",
             weight=0.8,
-            primary_keywords=["decentralize", "local control", "states' rights", "federalism", "devolution", "local autonomy", "regional power"],
-            secondary_keywords=["subsidiarity", "local governance", "community control", "bottom-up", "grassroots", "local decision-making"],
+            social_tendency=+0.45,
+            social_weight=1.0,
+            primary_keywords=[
+                "decentralization", "decentralize", "devolution", "federalism",
+                "local control", "regional autonomy", "states' rights", "subsidiarity",
+            ],
+            secondary_keywords=["local governance", "community control", "municipal authority", "local autonomy"],
             semantic_positive=[
-                "Power should be devolved to local communities.",
-                "Decentralization makes government more responsive.",
-                "Local control ensures decisions reflect community needs.",
-                "Federalism balances national and local interests.",
-                "Communities know their needs better than distant bureaucrats."
+                "Decisions should be made closer to local communities.",
+                "Power should be devolved to regions and municipalities.",
+                "Local control improves responsiveness and accountability.",
             ],
         )
 
-        self.categories["401"] = MarporCategory(
-            code="401",
-            label="Free Enterprise",
-            description="Free-market capitalism, private sector, entrepreneurship",
-            tendency="libertarian",
-            weight=1.0,
-            primary_keywords=["free market", "free enterprise", "economic freedom", "private sector", "deregulation", "capitalism", "market economy", "entrepreneurship"],
-            secondary_keywords=["business freedom", "competition", "innovation", "private ownership", "market forces", "economic liberty", "free trade"],
-            semantic_positive=[
-                "Free markets create prosperity and opportunity.",
-                "Private enterprise drives growth better than bureaucracy.",
-                "Economic freedom unleashes innovation and entrepreneurship.",
-                "Competition benefits consumers through lower prices and better quality.",
-                "Markets allocate resources more efficiently than government.",
-                "Capitalism has lifted billions out of poverty."
-            ],
-        )
-
-        self.categories["407"] = MarporCategory(
-            code="407",
-            label="Free Trade",
-            description="Free trade, open markets, against protectionism",
-            tendency="libertarian",
-            weight=0.8,
-            primary_keywords=["free trade", "open markets", "trade liberalization", "remove tariffs", "globalization", "international trade", "trade agreements"],
-            secondary_keywords=["trade openness", "market access", "trade barriers removal", "economic integration", "global commerce"],
-            semantic_positive=[
-                "Free trade benefits consumers and drives innovation.",
-                "Open markets create opportunities for businesses and workers.",
-                "Trade liberalization increases economic efficiency.",
-                "Global trade reduces poverty worldwide.",
-                "Tariffs hurt consumers and reduce economic growth."
-            ],
-        )
-
-        self.categories["414"] = MarporCategory(
-            code="414",
-            label="Economic Orthodoxy",
-            description="Tax cuts, balanced budgets, fiscal responsibility",
-            tendency="libertarian",
-            weight=0.9,
-            primary_keywords=["tax cuts", "cut taxes", "balanced budget", "fiscal responsibility", "deficit reduction", "fiscal discipline", "lower taxes"],
-            secondary_keywords=["fiscal prudence", "sound money", "budget balance", "tax relief", "spending restraint", "fiscal conservatism"],
-            semantic_positive=[
-                "Tax cuts stimulate economic growth and job creation.",
-                "Fiscal responsibility ensures long-term economic stability.",
-                "Balanced budgets prevent burdening future generations.",
-                "Lower taxes leave more money in people's pockets.",
-                "Government should live within its means like families do."
-            ],
-        )
-
-        self.categories["505"] = MarporCategory(
-            code="505",
-            label="Welfare State Limitation",
-            description="Limit welfare/social programs, promote self-reliance",
-            tendency="libertarian",
-            weight=0.8,
-            primary_keywords=["welfare reform", "limit welfare", "personal responsibility", "self-reliance", "work requirements", "welfare reduction"],
-            secondary_keywords=["self-sufficiency", "dependency reduction", "welfare-to-work", "individual responsibility", "earned benefits"],
-            semantic_positive=[
-                "Welfare reform should promote work and self-sufficiency.",
-                "Personal responsibility is key to breaking the cycle of poverty.",
-                "Work requirements restore dignity and encourage employment.",
-                "We need to limit welfare to those truly in need.",
-                "Dependency undermines individual initiative and dignity."
-            ],
-        )
-
-        self.categories["507"] = MarporCategory(
-            code="507",
-            label="Education Limitation / School Choice",
-            description="School choice, vouchers, charter schools",
-            tendency="libertarian",
-            weight=0.7,
-            primary_keywords=["school choice", "vouchers", "charter schools", "parental choice", "education vouchers", "school competition"],
-            secondary_keywords=["education freedom", "parental rights", "private schools", "education alternatives", "school options"],
-            semantic_positive=[
-                "Parents should have the right to choose their children's education.",
-                "School choice creates competition that improves all schools.",
-                "Educational freedom empowers families and students.",
-                "Vouchers give low-income families access to better schools.",
-                "Competition drives quality improvement in education."
-            ],
-        )
-
-        self.categories["702"] = MarporCategory(
-            code="702",
-            label="Anti-Union / Workplace Freedom",
-            description="Against compulsory unionism, right-to-work",
-            tendency="libertarian",
-            weight=0.7,
-            primary_keywords=["right to work", "reduce union power", "workplace freedom", "union reform", "voluntary unionism"],
-            secondary_keywords=["individual bargaining", "union accountability", "worker choice", "labor flexibility", "employment freedom"],
-            semantic_positive=[
-                "Right-to-work laws protect individual worker choice.",
-                "Workers should decide whether to join a union.",
-                "Union reform increases workplace flexibility and competitiveness.",
-                "Compulsory union membership violates freedom of association."
-            ],
-        )
-
-        self.categories["503"] = MarporCategory(
-            code="503",
-            label="Social Justice (Equality)",
-            description="Equality, equity, social justice, redistribution",
-            tendency="libertarian",
-            weight=0.7,
-            primary_keywords=["social justice", "equality", "equity", "redistribution", "fairness", "equal opportunity", "income equality"],
-            secondary_keywords=["economic justice", "wealth redistribution", "equal rights", "social equity", "progressive taxation"],
-            semantic_positive=[
-                "We need greater economic equality for a just society.",
-                "Social justice requires addressing income inequality.",
-                "Fair redistribution ensures everyone benefits from economic growth.",
-                "Equal opportunity means removing barriers to success.",
-                "Economic inequality threatens social cohesion and democracy."
-            ],
-        )
-
-        self.categories["604"] = MarporCategory(
+        C["604"] = MarporCategory(
             code="604",
             label="Social Freedom",
-            description="Social freedom, against moral policing, lifestyle autonomy",
+            description="Lifestyle autonomy; opposition to moral policing",
             tendency="libertarian",
             weight=0.8,
-            primary_keywords=["personal autonomy", "individual choice", "secular", "social freedom", "lifestyle freedom", "moral liberty"],
-            secondary_keywords=["personal choice", "private life", "individual lifestyle", "freedom of conscience", "personal morality"],
+            social_tendency=+0.75,
+            social_weight=1.0,
+            primary_keywords=[
+                "social freedom", "lifestyle freedom", "personal autonomy",
+                "private life", "freedom of conscience",
+                "reproductive freedom", "reproductive rights",
+                "abortion", "abortion rights", "birth control", "contraception",
+                "ivf", "in vitro fertilization",
+                "bodily autonomy",
+                "marriage equality", "same-sex marriage",
+            ],
+            secondary_keywords=[
+                "personal choice", "live as they choose", "moral policing", "individual lifestyle",
+                "privacy", "private decisions",
+            ],
             semantic_positive=[
-                "Personal lifestyle choices should remain private.",
-                "Individuals should be free to live as they choose.",
-                "Social freedom allows diverse lifestyles and beliefs.",
-                "The government shouldn't dictate personal moral choices.",
-                "Private decisions are not the state's business."
+                "The state should not police private moral choices.",
+                "People should be free to live as they choose.",
+                "Lifestyle decisions are not the government's business.",
+                "Bodily autonomy and private medical choices should be respected.",
             ],
         )
 
-        self.categories["607"] = MarporCategory(
+        C["607"] = MarporCategory(
             code="607",
             label="Multiculturalism",
-            description="Pro-diversity, inclusion, plural society",
+            description="Diversity, inclusion, pluralism, pro-minority rights",
             tendency="libertarian",
             weight=0.7,
-            primary_keywords=["multiculturalism", "diversity", "inclusion", "plural society", "cultural diversity", "pluralism"],
-            secondary_keywords=["multicultural", "inclusive society", "cultural pluralism", "diversity strength", "cultural richness"],
+            social_tendency=+0.55,
+            social_weight=1.0,
+            primary_keywords=["multiculturalism", "pluralism", "diversity", "inclusion"],
+            secondary_keywords=["inclusive society", "cultural diversity", "plural society", "equal respect"],
             semantic_positive=[
-                "Diversity and inclusion strengthen our society.",
-                "Multiculturalism enriches our culture and economy.",
-                "An inclusive society benefits everyone.",
-                "Cultural diversity is a source of strength.",
-                "Different perspectives and backgrounds drive innovation."
+                "Diversity and inclusion strengthen society.",
+                "A pluralistic society respects different cultures and identities.",
+                "Minorities deserve equal protection and equal rights.",
             ],
+            requires_context=["divers", "inclus", "plural", "minority", "culture"],
         )
 
-        self.categories["SJ"] = MarporCategory(
-            code="SJ",
-            label="Social Justice",
-            description="Equity, systemic reform, anti-discrimination, modern social justice",
+        C["401"] = MarporCategory(
+            code="401",
+            label="Free Enterprise",
+            description="Markets, private sector, deregulation, entrepreneurship",
+            tendency="libertarian",
+            weight=1.0,
+            economic_tendency=+0.95,
+            economic_weight=1.0,
+            primary_keywords=[
+                "free enterprise", "free market", "market economy", "deregulation",
+                "private sector", "entrepreneurship", "economic freedom",
+                "small business", "job creators", "reduce red tape",
+            ],
+            secondary_keywords=["competition", "private investment", "business friendly", "reduce regulation"],
+            semantic_positive=[
+                "Free markets drive growth and innovation.",
+                "The private sector creates jobs better than bureaucracy.",
+                "Deregulation reduces barriers for entrepreneurs.",
+                "Competition improves quality and lowers prices.",
+            ],
+            semantic_negative=[
+                "Markets must be replaced by state control and planning.",
+                "Private enterprise should be subordinated to government direction.",
+            ],
+            requires_context=["market", "private", "business", "dereg", "competition"],
+        )
+
+        C["407"] = MarporCategory(
+            code="407",
+            label="Free Trade",
+            description="Open trade, reduce tariffs, trade liberalization",
             tendency="libertarian",
             weight=0.8,
-            primary_keywords=["social justice", "equity", "systemic racism", "racial justice", "inclusion", "dei", "anti-discrimination"],
-            secondary_keywords=["structural inequality", "institutional bias", "systemic change", "inclusive justice", "equitable society"],
+            economic_tendency=+0.75,
+            economic_weight=1.0,
+            primary_keywords=["free trade", "trade liberalization", "open markets", "remove tariffs", "trade agreement"],
+            secondary_keywords=["lower tariffs", "reduce trade barriers", "market access", "global trade"],
             semantic_positive=[
-                "We must address systemic racism and inequality.",
-                "Social justice requires dismantling structural barriers.",
-                "Equity means ensuring everyone has what they need to succeed.",
-                "We need to build a more inclusive and just society.",
-                "Diversity, equity, and inclusion make organizations stronger.",
-                "Systemic change is needed to address historical injustices."
+                "Open trade benefits consumers and increases efficiency.",
+                "Reducing tariffs expands markets and lowers prices.",
+                "Trade agreements can create new opportunities for exporters.",
             ],
+            semantic_negative=[
+                "We should raise tariffs and restrict imports to protect domestic industry.",
+                "Trade barriers are necessary to stop foreign competition.",
+            ],
+            requires_context=["trade", "tariff", "import", "export", "agreement", "market"],
         )
 
-        self.categories["501"] = MarporCategory(
+        C["414"] = MarporCategory(
+            code="414",
+            label="Economic Orthodoxy",
+            description="Tax cuts, balanced budgets, fiscal restraint",
+            tendency="libertarian",
+            weight=0.9,
+            economic_tendency=+0.80,
+            economic_weight=1.0,
+            primary_keywords=[
+                "tax cuts", "cut taxes", "balanced budget", "fiscal responsibility", "deficit reduction",
+                "tax breaks", "tax relief", "middle class tax cut", "middle-class tax cut",
+                "reduce spending", "spending restraint",
+            ],
+            secondary_keywords=["lower taxes", "spending restraint", "fiscal discipline", "budget balance"],
+            semantic_positive=[
+                "Lower taxes encourage investment and growth.",
+                "Balanced budgets protect future generations from debt.",
+                "Fiscal discipline is necessary to stabilize the economy.",
+            ],
+            semantic_negative=[
+                "Deficits do not matter; we should spend without restraint.",
+                "Taxes must rise substantially to expand government permanently.",
+            ],
+            requires_context=["tax", "budget", "deficit", "debt", "fiscal"],
+        )
+
+        C["505"] = MarporCategory(
+            code="505",
+            label="Welfare State Limitation",
+            description="Limit welfare; emphasize work requirements and self-reliance",
+            tendency="libertarian",
+            weight=0.8,
+            economic_tendency=+0.60,
+            economic_weight=1.0,
+            primary_keywords=["welfare reform", "work requirements", "limit welfare", "self-reliance", "personal responsibility"],
+            secondary_keywords=["reduce benefits", "welfare dependency", "targeted assistance", "welfare-to-work"],
+            semantic_positive=[
+                "Welfare programs should encourage work and self-sufficiency.",
+                "Work requirements reduce dependency and restore dignity.",
+                "Benefits should be targeted to those truly in need.",
+            ],
+            semantic_negative=[
+                "We should expand welfare benefits universally with no conditions.",
+                "Government must provide permanent income support for everyone.",
+            ],
+            requires_context=["welfare", "benefit", "work", "assistance", "dependency"],
+        )
+
+        C["507"] = MarporCategory(
+            code="507",
+            label="School Choice / Education Limitation",
+            description="Vouchers, charter schools, parental choice, competition",
+            tendency="libertarian",
+            weight=0.7,
+            social_tendency=+0.20,
+            social_weight=0.3,
+            economic_tendency=+0.45,
+            economic_weight=0.7,
+            primary_keywords=["school choice", "vouchers", "charter schools", "parental choice"],
+            secondary_keywords=["education freedom", "private schools", "education market", "competition in education"],
+            semantic_positive=[
+                "Parents should be able to choose the best school for their children.",
+                "Vouchers can expand options for low-income families.",
+                "Competition can improve school performance.",
+            ],
+            semantic_negative=[
+                "School choice undermines public education and should be abolished.",
+                "We should ban charter schools and vouchers.",
+            ],
+            requires_context=["school", "education", "voucher", "charter", "parent"],
+        )
+
+        C["702"] = MarporCategory(
+            code="702",
+            label="Anti-Union / Workplace Freedom",
+            description="Right-to-work, limit compulsory unionism",
+            tendency="libertarian",
+            weight=0.7,
+            social_tendency=+0.15,
+            social_weight=0.3,
+            economic_tendency=+0.40,
+            economic_weight=0.7,
+            primary_keywords=["right to work", "voluntary unionism", "union reform", "reduce union power"],
+            secondary_keywords=["workplace freedom", "union accountability", "worker choice"],
+            semantic_positive=[
+                "Workers should choose whether to join a union.",
+                "Compulsory union membership violates freedom of association.",
+                "Right-to-work protects individual choice in the workplace.",
+            ],
+            semantic_negative=[
+                "Unions must be strengthened through mandatory membership.",
+                "We should require workers to join unions to protect labor.",
+            ],
+            requires_context=["union", "worker", "workplace", "bargaining", "right-to-work"],
+        )
+
+        C["503"] = MarporCategory(
+            code="503",
+            label="Social Justice (Equality)",
+            description="Equality, redistribution, progressive taxation, equity framing",
+            tendency="libertarian",
+            weight=0.7,
+            social_tendency=+0.20,
+            social_weight=0.3,
+            economic_tendency=-0.60,
+            economic_weight=1.0,
+            primary_keywords=[
+                "redistribution", "income inequality", "wealth tax", "progressive taxation", "economic equality",
+                "billionaire tax", "millionaire tax", "tax the rich", "close tax loopholes",
+                "raise corporate taxes", "corporate tax rate", "fair share", "tax fairness",
+                "tax breaks for the rich", "tax breaks for billionaires",
+            ],
+            secondary_keywords=[
+                "reduce inequality", "equity", "fair share", "social justice", "equal opportunity",
+                "working families", "middle class", "middle-class",
+            ],
+            semantic_positive=[
+                "We must reduce inequality through progressive taxation.",
+                "Redistribution can make growth fairer for working families.",
+                "The wealthy should pay their fair share to fund public goods.",
+            ],
+            semantic_negative=[
+                "Redistribution is harmful; inequality is not a problem to address.",
+                "Progressive taxes should be eliminated entirely.",
+            ],
+            requires_context=["inequal", "redistrib", "tax", "wealth", "equity", "equality", "billion", "loophole"],
+        )
+
+        C["SJ"] = MarporCategory(
+            code="SJ",
+            label="Modern Social Justice / Anti-Discrimination",
+            description="Anti-discrimination, systemic inequality, inclusion, DEI",
+            tendency="libertarian",
+            weight=0.8,
+            social_tendency=+0.35,
+            social_weight=0.6,
+            economic_tendency=-0.35,
+            economic_weight=0.6,
+            primary_keywords=["systemic racism", "anti-discrimination", "dei", "equity", "inclusion", "racial justice"],
+            secondary_keywords=["structural inequality", "institutional bias", "marginalized communities", "inclusive justice"],
+            semantic_positive=[
+                "We must address systemic discrimination and structural barriers.",
+                "Equal protection requires enforcing anti-discrimination laws.",
+                "Inclusion and equity expand opportunity for marginalized groups.",
+            ],
+            semantic_negative=[
+                "Anti-discrimination policy is unnecessary and should be rolled back.",
+                "We should abolish DEI programs entirely.",
+            ],
+            requires_context=["discrimin", "equity", "inclus", "rac", "bias", "systemic"],
+        )
+
+        C["501"] = MarporCategory(
             code="501",
             label="Environmental Protection",
-            description="Environmental protection, climate action, sustainability",
+            description="Climate action, sustainability, conservation, clean energy",
             tendency="libertarian",
             weight=0.7,
-            primary_keywords=["climate change", "environment", "renewable energy", "clean energy", "sustainability", "environmental protection", "green energy"],
-            secondary_keywords=["climate action", "ecological", "conservation", "green economy", "carbon reduction", "sustainable development"],
+            social_tendency=+0.10,
+            social_weight=0.2,
+            economic_tendency=-0.25,
+            economic_weight=0.5,
+            primary_keywords=["climate change", "renewable energy", "clean energy", "sustainability", "environmental protection"],
+            secondary_keywords=["carbon emissions", "conservation", "green transition", "net zero"],
             semantic_positive=[
-                "We must protect our environment for future generations.",
-                "Clean energy creates jobs and protects our planet.",
-                "Market-based solutions can effectively reduce emissions.",
-                "Environmental stewardship is our responsibility.",
-                "Climate change threatens our prosperity and security."
+                "We must protect the environment for future generations.",
+                "Clean energy investment reduces emissions and creates jobs.",
+                "Climate action is necessary to reduce risk and harm.",
             ],
+            semantic_negative=[
+                "Climate policy is a hoax and should be abandoned.",
+                "Environmental protections should be dismantled to boost industry.",
+            ],
+            requires_context=["climate", "emission", "renew", "environment", "carbon", "pollution"],
         )
 
-        # ==================== AUTHORITARIAN ====================
-
-        self.categories["605"] = MarporCategory(
+        C["605"] = MarporCategory(
             code="605",
             label="Law and Order",
-            description="Tough on crime, strict law enforcement, public safety emphasis",
+            description="Tough policing, strict enforcement, crackdown, zero tolerance",
             tendency="authoritarian",
             weight=0.85,
-            primary_keywords=["law and order", "tough on crime", "crackdown", "zero tolerance", "public safety", "crime control", "strict enforcement"],
-            secondary_keywords=["law enforcement", "crime prevention", "public security", "order maintenance", "criminal justice", "police power"],
+            social_tendency=-0.85,
+            social_weight=1.0,
+            primary_keywords=["law and order", "tough on crime", "zero tolerance", "crackdown", "strict enforcement"],
+            secondary_keywords=["public safety", "strong policing", "harsher penalties", "more police"],
             semantic_positive=[
-                "We need tough law enforcement to keep our streets safe.",
-                "Zero tolerance policies deter crime effectively.",
-                "Strong policing is essential for public safety.",
-                "We must crack down on crime and disorder.",
-                "Law and order is the foundation of a civilized society."
+                "We must crack down on crime with strict enforcement.",
+                "Zero tolerance policies deter disorder and violence.",
+                "Strong policing is necessary for public safety.",
             ],
-            requires_context=["crime", "enforcement", "crackdown", "zero tolerance", "public safety", "strict"],
-            excludes_context=["oversight", "accountability", "reform", "community policing"],
+            semantic_negative=[
+                "We should reduce police powers and avoid punitive enforcement.",
+                "Strict policing creates harm and must be rolled back.",
+            ],
+            requires_context=["crime", "police", "enforce", "order", "safety", "penalt"],
+            excludes_context=["accountability", "oversight", "reform", "community policing"],
         )
 
-        self.categories["302"] = MarporCategory(
+        C["GUN"] = MarporCategory(
+            code="GUN",
+            label="Gun Regulation / Weapons Control",
+            description="Firearms regulation, background checks, assault weapons bans, restrictions on weapons",
+            tendency="authoritarian",
+            weight=0.75,
+            social_tendency=-0.55,
+            social_weight=0.9,
+            economic_tendency=0.0,
+            economic_weight=0.0,
+            primary_keywords=[
+                "gun control", "firearms regulation", "weapons regulation",
+                "universal background checks", "background checks",
+                "assault weapons ban", "assault weapon ban", "ban assault weapons",
+                "red flag laws", "red-flag laws",
+                "gun violence",
+            ],
+            secondary_keywords=[
+                "restrict guns", "restrict firearms", "weapon restrictions",
+                "gun safety law", "gun safety laws", "firearm restrictions",
+                "magazine limits", "high-capacity magazine ban", "safe storage laws",
+            ],
+            semantic_positive=[
+                "We need universal background checks to reduce gun violence.",
+                "Assault weapons should be banned to protect public safety.",
+                "Red flag laws can prevent tragedies by temporarily restricting access to firearms.",
+                "Gun safety laws must be strengthened and enforced.",
+            ],
+            semantic_negative=[
+                "Gun control is an attack on individual rights and should be rejected.",
+                "Restrictions on firearms should be rolled back.",
+            ],
+            requires_context=["gun", "firearm", "weapon", "background check", "assault", "violence"],
+            excludes_context=["video game", "metaphor", "shoot for", "shooting for"],
+            requires_context_hard=False,
+        )
+
+        C["302"] = MarporCategory(
             code="302",
             label="Centralization",
-            description="Centralized power, top-down control, strong central government",
+            description="Strong centralized power, top-down control, national command",
             tendency="authoritarian",
             weight=0.9,
-            primary_keywords=["centralize", "centralization", "strong central government", "top-down control", "federal authority", "central power"],
-            secondary_keywords=["national control", "unified command", "central coordination", "federal supremacy", "centralized decision-making"],
+            social_tendency=-0.80,
+            social_weight=1.0,
+            primary_keywords=["centralization", "centralize", "strong central government", "top-down control"],
+            secondary_keywords=["national control", "unified command", "central authority", "federal supremacy"],
             semantic_positive=[
-                "We need strong central authority to ensure uniform action.",
-                "Centralized planning is more efficient than local control.",
-                "Top-down direction ensures coordinated national response.",
-                "Consolidating power at the federal level improves governance.",
-                "Only central government has resources for major challenges."
+                "Central authority is needed to coordinate national policy.",
+                "Top-down direction ensures uniform enforcement and compliance.",
+                "Decisions should be centralized for efficiency and control.",
             ],
-            requires_context=["control", "authority", "command", "central", "consolidate"],
+            semantic_negative=[
+                "Power should be devolved to local communities instead of centralized.",
+            ],
+            requires_context=["central", "authority", "control", "command", "national"],
         )
 
-        self.categories["305"] = MarporCategory(
+        C["305"] = MarporCategory(
             code="305",
             label="Political Authority",
-            description="Strong leadership, decisive action, authority emphasis",
+            description="Strong leadership, executive power, decisive authority",
             tendency="authoritarian",
             weight=0.8,
-            primary_keywords=["strong leadership", "decisive action", "firm hand", "authority", "leadership", "strong government", "executive power"],
-            secondary_keywords=["decisive leadership", "authoritative", "command", "firm governance", "strong executive"],
+            social_tendency=-0.75,
+            social_weight=1.0,
+            primary_keywords=["strong leadership", "executive power", "decisive action", "firm hand", "state authority"],
+            secondary_keywords=["authority", "strong government", "order and stability", "rule with strength"],
             semantic_positive=[
-                "We need strong leadership to restore order and stability.",
-                "Decisive action is necessary in times of crisis.",
-                "A firm hand guides the nation through challenges.",
-                "Strong authority ensures effective governance.",
-                "Leadership requires the will to act decisively."
+                "We need strong leadership to restore stability.",
+                "Decisive authority is necessary in times of crisis.",
+                "A strong executive must act without delay to ensure order.",
             ],
-            requires_context=["authority", "executive", "command", "enforce", "order", "security"],
-            requires_context_hard=True,
+            semantic_negative=[
+                "Strong executive authority is dangerous and should be constrained.",
+                "We must limit leaders through checks and balances.",
+            ],
+            requires_context=["authority", "executive", "order", "stability", "enforce"],
+            requires_context_hard=False,
         )
 
-        self.categories["603"] = MarporCategory(
+        C["603"] = MarporCategory(
             code="603",
             label="Traditional Morality",
-            description="Traditional values, family values, religious morality",
+            description="Traditional values, religious morality, social conservatism",
             tendency="authoritarian",
             weight=0.8,
-            primary_keywords=["traditional values", "family values", "religious", "moral standards", "pro-life", "traditional family", "moral order"],
-            secondary_keywords=["religious values", "moral tradition", "family structure", "traditional marriage", "moral foundation"],
+            social_tendency=-0.70,
+            social_weight=1.0,
+            primary_keywords=["traditional values", "family values", "religious values", "moral standards", "sanctity of life"],
+            secondary_keywords=["traditional marriage", "moral order", "faith-based", "religious tradition"],
             semantic_positive=[
                 "We must defend traditional family values.",
                 "Religious faith provides moral guidance for society.",
-                "Traditional values strengthen communities and families.",
-                "The sanctity of life must be protected.",
-                "Moral standards are essential for social cohesion."
+                "Traditional norms strengthen social cohesion and stability.",
             ],
+            semantic_negative=[
+                "Traditional morality should not be enforced by the state.",
+                "Religious values must not dictate public policy.",
+            ],
+            requires_context=["traditional", "moral", "relig", "family", "values"],
+            excludes_context=["thank you", "god bless", "applause"],
         )
 
-        self.categories["601"] = MarporCategory(
+        C["601"] = MarporCategory(
             code="601",
             label="National Way of Life",
-            description="National identity, patriotism, sovereignty, cultural heritage",
+            description="National identity, sovereignty, patriotism, cultural heritage",
             tendency="authoritarian",
             weight=0.8,
-            primary_keywords=["national identity", "patriotism", "sovereignty", "our nation", "national heritage", "national pride", "cultural identity"],
-            secondary_keywords=["national culture", "national traditions", "national unity", "cultural heritage", "national values"],
+            social_tendency=-0.65,
+            social_weight=1.0,
+            primary_keywords=["national identity", "sovereignty", "patriotism", "national heritage", "national pride"],
+            secondary_keywords=["our way of life", "cultural heritage", "national unity", "defend our nation"],
             semantic_positive=[
-                "We must defend our national identity and sovereignty.",
-                "Patriotism means loving and supporting our country.",
-                "Our national heritage and traditions must be preserved.",
-                "A strong national identity unites our people.",
-                "National pride is essential for social cohesion."
+                "We must defend national identity and sovereignty.",
+                "Patriotism means preserving our traditions and heritage.",
+                "National unity requires loyalty to our shared values.",
             ],
-            requires_context=["sovereignty", "identity", "heritage", "tradition", "patriot", "national pride"],
-            excludes_context=["may god bless", "god bless", "thank you"],
-            requires_context_hard=True,
+            semantic_negative=[
+                "National identity should not be used to exclude minorities.",
+                "Patriotism must not override civil liberties.",
+            ],
+            requires_context=["sovereign", "patriot", "heritage", "identity", "nation"],
+            excludes_context=["thank you", "god bless", "applause"],
         )
 
-        self.categories["608"] = MarporCategory(
+        C["608"] = MarporCategory(
             code="608",
-            label="Anti-Multiculturalism / Immigration Restriction",
-            description="Assimilation emphasis, immigration restriction, border control",
+            label="Immigration Restriction / Anti-Multiculturalism",
+            description="Assimilation, border control, immigration limits",
             tendency="authoritarian",
             weight=0.8,
-            primary_keywords=["assimilation", "limit immigration", "border security", "secure the border", "deport", "immigration control", "cultural unity"],
-            secondary_keywords=["cultural integration", "immigration restriction", "border control", "cultural cohesion", "controlled immigration"],
+            social_tendency=-0.60,
+            social_weight=1.0,
+            primary_keywords=["border security", "secure the border", "limit immigration", "deport", "assimilation"],
+            secondary_keywords=["immigration restriction", "border control", "illegal immigration", "cultural unity"],
             semantic_positive=[
+                "We need strict border control and limits on immigration.",
                 "Immigrants must assimilate to our national culture.",
-                "We need strong borders to protect our national identity.",
-                "Cultural unity is essential for social cohesion.",
-                "Illegal immigration threatens our sovereignty and security.",
-                "Controlled immigration protects jobs and wages."
+                "Illegal immigration threatens sovereignty and security.",
             ],
+            semantic_negative=[
+                "We should expand immigration and protect migrant rights.",
+                "Border restrictions are harmful and should be relaxed.",
+            ],
+            requires_context=["border", "immig", "deport", "illegal", "assimil"],
         )
 
-        # --- KEYWORD FIXES REQUESTED: 404 / 504 / 701 --------------------------
-
-        self.categories["404"] = MarporCategory(
+        C["404"] = MarporCategory(
             code="404",
-            label="Economic Planning",
-            description="State economic planning, industrial policy, government-led development",
+            label="Economic Planning / Industrial Policy",
+            description="State-led planning, industrial policy, strategic investment",
             tendency="authoritarian",
             weight=0.9,
-            primary_keywords=[
-                "economic planning", "planned economy", "central planning",
-                "economic justice", "economic intervention", "industrial policy",
-                "government investment", "public investment",
-                "economic development", "rebuild economy",
-                "government planning", "state-led", "state-led development", "directed economy",
-            ],
-            secondary_keywords=[
-                "economic coordination", "strategic planning", "state guidance", "government intervention",
-                "public spending", "national development plan", "planning commission",
-            ],
+            economic_tendency=-0.80,
+            economic_weight=1.0,
+            primary_keywords=["industrial policy", "economic planning", "state-led", "national development plan", "planning commission"],
+            secondary_keywords=["strategic sectors", "public investment plan", "government-led development", "directed economy"],
             semantic_positive=[
-                "Government-led economic planning ensures balanced development.",
-                "Industrial policy guides strategic sectors for national benefit.",
-                "Central planning coordinates economic activity efficiently.",
-                "State direction of the economy prevents market failures.",
-                "Strategic planning is essential for long-term development.",
-                "We need economic justice and government investment to rebuild the economy.",
+                "Government should coordinate long-term industrial strategy.",
+                "State planning can guide strategic investment and development.",
+                "Industrial policy is needed to rebuild key sectors.",
             ],
+            semantic_negative=[
+                "Government should not plan the economy; markets should decide.",
+            ],
+            requires_context=["plan", "industrial", "strategy", "state-led", "development", "investment"],
         )
 
-        self.categories["412"] = MarporCategory(
+        C["412"] = MarporCategory(
             code="412",
-            label="Controlled Economy",
-            description="State control of economy, price controls, heavy regulation",
+            label="Controlled Economy / Heavy Regulation",
+            description="Price controls, managed economy, strong regulation",
             tendency="authoritarian",
             weight=0.9,
-            primary_keywords=["state control", "controlled economy", "price controls", "wage controls", "government regulation", "economic control"],
-            secondary_keywords=["regulatory control", "state intervention", "managed economy", "price regulation", "economic regulation"],
+            economic_tendency=-0.70,
+            economic_weight=1.0,
+            primary_keywords=["price controls", "wage controls", "controlled economy", "managed economy", "government control of prices"],
+            secondary_keywords=["strong regulation", "regulatory control", "state intervention", "market controls"],
             semantic_positive=[
-                "The state must control key prices to protect consumers.",
-                "Government control of the economy ensures fair outcomes.",
-                "Price controls prevent exploitation by corporations.",
-                "Strong economic regulation protects public interest.",
-                "Market failures require government intervention."
+                "The government must control prices to protect consumers.",
+                "A managed economy prevents exploitation and instability.",
+                "Strong regulation is needed to correct market failures.",
             ],
+            semantic_negative=[
+                "Price controls distort markets and should be removed.",
+                "Regulation should be reduced to allow market competition.",
+            ],
+            requires_context=["control", "regulat", "price", "wage", "managed"],
         )
 
-        self.categories["413"] = MarporCategory(
+        C["413"] = MarporCategory(
             code="413",
             label="Nationalization",
-            description="State ownership of industry, public ownership",
+            description="Public ownership of industry; state ownership of key sectors",
             tendency="authoritarian",
             weight=0.9,
-            primary_keywords=["nationalization", "state ownership", "public ownership", "nationalize industry", "government ownership"],
-            secondary_keywords=["public control", "state enterprise", "national ownership", "socialization", "collective ownership"],
-            semantic_positive=[
-                "Key industries should be nationalized for public benefit.",
-                "State ownership ensures essential services are affordable.",
-                "Public control of utilities protects consumers from exploitation.",
-                "Nationalized industries serve the national interest.",
-                "Strategic sectors must be under public ownership."
+            economic_tendency=-0.85,
+            economic_weight=1.0,
+            primary_keywords=[
+                "nationalization", "nationalise", "nationalize", "state ownership",
+                "public ownership", "government ownership", "nationalize industry",
             ],
+            secondary_keywords=[
+                "public control", "state enterprise", "state-owned enterprise", "soe",
+                "public enterprise", "bring into public hands", "public takeover",
+            ],
+            semantic_positive=[
+                "Nationalize key sectors of the economy to serve the public interest.",
+                "Bring utilities and infrastructure under public ownership.",
+                "Transfer private monopolies into state ownership.",
+                "The state should own strategic industries like energy and rail.",
+                "Create state-owned enterprises to run essential services.",
+            ],
+            semantic_negative=[
+                "Oppose nationalization and protect private ownership of industry.",
+                "Privatize industries currently owned by the state.",
+                "Reject state takeovers of private companies.",
+            ],
+            requires_context=["own", "industry", "sector", "utility", "state-owned", "public", "national"],
         )
 
-        self.categories["504"] = MarporCategory(
+        C["504"] = MarporCategory(
             code="504",
             label="Welfare State Expansion",
-            description="Expand welfare/social programs, universal services",
+            description="Expand welfare programs, universal services, social safety net",
             tendency="authoritarian",
             weight=0.9,
+            economic_tendency=-0.90,
+            economic_weight=1.0,
             primary_keywords=[
-                "welfare", "welfare state", "welfare expansion", "expand welfare",
-                "social programs", "safety net", "entitlement", "public assistance", "social services",
-                "healthcare is a right", "universal healthcare", "healthcare is a right, not a privilege",
-                "expand obamacare", "obamacare expansion", "affordable care act", "aca",
-                "medicare for all", "medicaid expansion", "social security",
-                "unemployment benefits", "food stamps", "snap", "wic",
-                "public services", "universal services",
+                "expand welfare", "welfare expansion", "universal healthcare", "healthcare is a right",
+                "social safety net", "public assistance", "unemployment benefits", "social programs",
+                "social security", "medicare", "medicaid", "medicaid expansion",
+                "affordable care act", "aca", "pre-existing conditions", "preexisting conditions",
+                "child tax credit", "earned income tax credit",
+                "snap", "food stamps",
+                "paid family leave", "universal childcare", "child care",
             ],
             secondary_keywords=[
-                "social safety net", "universal provision", "public provision", "welfare benefits",
-                "child benefit", "family allowance", "income support",
+                "universal services", "expand benefits", "strong safety net", "public provision",
+                "health insurance", "coverage", "lower prescription drug costs", "prescription drug costs",
             ],
             semantic_positive=[
-                "We must expand social programs to protect the vulnerable.",
-                "Universal healthcare is a right, not a privilege.",
-                "A strong safety net ensures no one falls through the cracks.",
-                "Government should provide essential services to all.",
-                "Social programs are investments in human capital.",
-                "We should expand Obamacare and strengthen the safety net.",
+                "We should expand the social safety net to protect vulnerable people.",
+                "Universal healthcare should be guaranteed as a right.",
+                "Government must provide essential services to all citizens.",
+                "Social Security and Medicare must be protected and strengthened.",
+                "People with pre-existing conditions must keep their health coverage.",
             ],
+            semantic_negative=[
+                "Welfare programs should be cut back or limited.",
+                "Universal benefits are too costly and should not be expanded.",
+                "Social programs should be privatized rather than expanded.",
+            ],
+            requires_context=["welfare", "benefit", "universal", "healthcare", "safety net", "assistance", "medicare", "medicaid", "social security"],
         )
 
-        self.categories["701"] = MarporCategory(
+        C["701"] = MarporCategory(
             code="701",
-            label="Labour Groups",
-            description="Pro-union, collective bargaining, workers' rights",
+            label="Labour Groups / Pro-Union",
+            description="Workers' rights, unions, collective bargaining",
             tendency="authoritarian",
             weight=0.8,
-            primary_keywords=[
-                "unions", "labor unions", "trade unions", "collective bargaining",
-                "workers' rights", "worker rights", "union rights", "organized labor",
-                "unions built", "union workers", "union membership",
-                "right to organize", "strike", "picket line",
-                "labor movement", "workers solidarity", "worker solidarity",
-                "essential workers", "working families", "middle class workers",
-            ],
-            secondary_keywords=[
-                "labor organization", "union protection", "collective rights", "labor strength",
-                "shop steward", "union contract", "collective agreement",
-            ],
+            social_tendency=+0.10,
+            social_weight=0.2,
+            economic_tendency=-0.70,
+            economic_weight=1.0,
+            primary_keywords=["collective bargaining", "right to organize", "trade unions", "labor unions", "workers' rights"],
+            secondary_keywords=["union protections", "organized labor", "union contract", "labor movement"],
             semantic_positive=[
                 "Strong unions protect workers from exploitation.",
-                "Collective bargaining ensures fair wages and conditions.",
-                "Worker solidarity is essential for economic justice.",
-                "The right to organize must be protected and expanded.",
-                "Unions built the middle class and remain essential."
+                "Collective bargaining raises wages and improves conditions.",
+                "Workers must have the right to organize without retaliation.",
             ],
+            semantic_negative=[
+                "Unions should be weakened and collective bargaining restricted.",
+            ],
+            requires_context=["union", "worker", "bargain", "organize", "labor"],
         )
 
-        self.categories["PROT"] = MarporCategory(
+        C["PROT"] = MarporCategory(
             code="PROT",
             label="Protectionism",
             description="Tariffs, trade barriers, economic nationalism",
             tendency="authoritarian",
             weight=0.85,
-            primary_keywords=["tariffs", "protectionism", "trade barriers", "buy american", "america first", "economic nationalism", "protect jobs"],
-            secondary_keywords=["trade protection", "domestic industry", "import restrictions", "trade defense", "local production"],
+            economic_tendency=-0.40,
+            economic_weight=1.0,
+            primary_keywords=["tariffs", "protectionism", "trade barriers", "economic nationalism", "import restrictions"],
+            secondary_keywords=["buy local", "buy domestic", "protect jobs", "protect industry", "raise tariffs"],
             semantic_positive=[
-                "Tariffs protect workers and industries.",
-                "We need trade barriers to bring manufacturing back home.",
-                "Buy local policies support our domestic economy.",
-                "Protectionism is necessary for national economic security.",
-                "Free trade has devastated our manufacturing base."
+                "Tariffs protect domestic jobs and industries from foreign competition.",
+                "We need trade barriers to defend national economic security.",
+                "Import restrictions will rebuild domestic manufacturing.",
             ],
+            semantic_negative=[
+                "Tariffs harm consumers and should be reduced.",
+                "Trade barriers should be removed to encourage competition.",
+            ],
+            requires_context=["tariff", "import", "trade", "domestic", "manufactur"],
         )
 
-        self.categories["POP"] = MarporCategory(
+        C["POP"] = MarporCategory(
             code="POP",
             label="Populism",
-            description="People vs elite, anti-establishment",
+            description="People vs elites, anti-establishment framing",
             tendency="authoritarian",
             weight=0.75,
-            primary_keywords=["the people", "ordinary citizens", "elites", "establishment", "drain the swamp", "corrupt elite", "people's will"],
-            secondary_keywords=["common people", "working people", "elite corruption", "anti-establishment", "popular will"],
+            social_tendency=-0.20,
+            social_weight=0.5,
+            primary_keywords=["drain the swamp", "corrupt elite", "the establishment", "rigged system", "elites"],
+            secondary_keywords=["the people", "ordinary citizens", "anti-establishment", "silent majority"],
             semantic_positive=[
-                "This is a movement of ordinary people against the political establishment.",
-                "We're taking power back from the elites and giving it to the people.",
-                "The silent majority has been ignored for too long.",
-                "We need to drain the swamp of corruption.",
-                "Elites have rigged the system against working people."
+                "The political elites have rigged the system against ordinary people.",
+                "We will take power back from the establishment.",
+                "This movement is the people versus the corrupt elite.",
             ],
-            requires_context=["elite", "elites", "establishment", "corrupt", "rigged", "swamp"],
+            semantic_negative=[
+                "Anti-elite rhetoric is misleading and should be rejected.",
+            ],
+            requires_context=["elite", "establishment", "rigged", "corrupt", "swamp"],
             requires_context_hard=True,
         )
 
-        self.categories["ENV_AUTH"] = MarporCategory(
+        C["ENV_AUTH"] = MarporCategory(
             code="ENV_AUTH",
             label="Environmental Authoritarianism",
-            description="Strong state environmental regulation, climate emergency measures",
+            description="Mandatory climate controls, strict enforcement, emergency measures",
             tendency="authoritarian",
             weight=0.7,
-            primary_keywords=["climate emergency", "environmental regulation", "green new deal", "climate action", "mandatory reduction", "environmental mandate"],
-            secondary_keywords=["climate mandate", "environmental enforcement", "green policy", "climate compliance", "environmental control"],
+            social_tendency=-0.30,
+            social_weight=0.5,
+            economic_tendency=-0.35,
+            economic_weight=0.6,
+            primary_keywords=["climate emergency", "mandatory reductions", "strict environmental regulation", "climate mandate"],
+            secondary_keywords=["enforcement of climate policy", "mandatory compliance", "emissions mandates", "forced transition"],
             semantic_positive=[
-                "We need strong government action to address the climate emergency.",
-                "Environmental regulations must be strictly enforced.",
-                "The state must lead the transition to a green economy.",
-                "Climate action requires top-down coordination and control.",
-                "Only government has the power to enforce climate compliance."
+                "Climate action requires mandatory compliance and strict enforcement.",
+                "The state must impose firm limits on emissions and industrial activity.",
+                "Emergency climate measures require centralized coordination and control.",
             ],
+            semantic_negative=[
+                "Climate policy should rely on voluntary or market-based approaches.",
+            ],
+            requires_context=["climate", "mandatory", "enforce", "compliance", "regulation"],
         )
 
-        # ==================== CENTRIST DISCOURSE (NOT IDEOLOGY) ====================
-
-        self.categories["CENT"] = MarporCategory(
+        C["CENT"] = MarporCategory(
             code="CENT",
-            label="Centrist/Moderate",
-            description="Balanced approach, pragmatism, moderation, compromise",
+            label="Moderation / Pragmatism (Non-ideology)",
+            description="Balanced approach, pragmatism, compromise; NON-IDEOLOGICAL bucket",
             tendency="centrist",
             weight=0.6,
-            primary_keywords=["balance", "moderation", "pragmatism", "compromise", "middle ground", "moderate approach", "balanced solution"],
-            secondary_keywords=["practical solution", "centrist", "moderate position", "balanced policy", "pragmatic approach"],
+            primary_keywords=["middle ground", "balanced approach", "pragmatism", "moderation", "compromise"],
+            secondary_keywords=["centrist", "pragmatic", "reasonable", "not ideological", "common sense solution"],
             semantic_positive=[
-                "We need a balanced approach that considers all perspectives.",
-                "Practical solutions are more important than ideological purity.",
-                "Finding common ground benefits everyone.",
-                "Moderation and compromise are essential in politics.",
-                "Extreme positions on either side are counterproductive."
+                "We need pragmatic solutions rather than ideological purity.",
+                "A balanced approach considers multiple perspectives.",
+                "Compromise is necessary to make progress.",
             ],
+            excludes_context=["thank you", "god bless", "applause"],
         )
 
-        self.categories["BI"] = MarporCategory(
+        C["BI"] = MarporCategory(
             code="BI",
-            label="Bipartisan/Cross-party",
-            description="Cross-party cooperation, bipartisan solutions",
+            label="Bipartisan / Cross-party (Non-ideology)",
+            description="Cross-party cooperation and unity; NON-IDEOLOGICAL bucket",
             tendency="centrist",
             weight=0.7,
-            primary_keywords=["bipartisan", "cross-party", "working together", "cooperation", "unity", "both sides", "across the aisle"],
-            secondary_keywords=["collaboration", "joint effort", "unified approach", "coalition", "partnership"],
+            primary_keywords=["bipartisan", "across the aisle", "cross-party", "working together", "common ground"],
+            secondary_keywords=["cooperation", "unity", "collaboration", "joint effort"],
             semantic_positive=[
-                "We need bipartisan solutions to solve our problems.",
-                "Working across the aisle produces better results.",
-                "Cooperation between parties is essential for progress.",
-                "Unity and collaboration benefit the entire nation.",
-                "Both sides must come together for the common good."
+                "We must work across parties to solve major problems.",
+                "Bipartisan cooperation produces better outcomes.",
+                "Both sides should come together for the common good.",
             ],
+            excludes_context=["thank you", "god bless", "applause"],
         )
 
-        self.categories["REF"] = MarporCategory(
+        C["REF"] = MarporCategory(
             code="REF",
-            label="Reform/Improvement",
-            description="Incremental reform, improvement, fixing systems",
+            label="Reform / Improvement (Non-ideology)",
+            description="Incremental improvement, modernization; NON-IDEOLOGICAL bucket",
             tendency="centrist",
             weight=0.7,
-            primary_keywords=["reform", "improve", "fix", "better", "progress", "modernize", "update", "enhance"],
-            secondary_keywords=["improvement", "refinement", "upgrading", "enhancement", "optimization", "strengthening"],
+            primary_keywords=["reform", "modernize", "improve", "fix the system", "upgrade"],
+            secondary_keywords=["incremental", "step by step", "practical reform", "better governance"],
             semantic_positive=[
-                "We need to reform and improve existing systems.",
-                "Incremental progress is better than radical change.",
-                "Fixing what's broken benefits everyone.",
-                "Steady improvement leads to lasting results.",
-                "Reform is essential for maintaining relevance."
+                "We should reform institutions to make them work better.",
+                "Incremental improvements can produce lasting change.",
+                "Modernization is necessary to keep systems effective.",
             ],
+            excludes_context=["thank you", "god bless", "applause"],
         )
 
-    # -------------------------------------------------------------------------
-    # PATTERN COMPILATION
-    # -------------------------------------------------------------------------
+    def _compile_patterns_for_code(self, code: str) -> None:
+        cat = self.categories.get(code)
+        if not cat:
+            return
+        pats: List[Tuple[str, re.Pattern]] = []
+        for keyword in cat.get_all_keywords():
+            kw = keyword.lower().strip()
+            if not kw:
+                continue
+            if " " in kw:
+                escaped = r"\s+".join(map(re.escape, kw.split()))
+            else:
+                escaped = re.escape(kw)
+            pattern_str = r"\b" + escaped + r"\b"
+            pats.append((keyword, re.compile(pattern_str, re.IGNORECASE)))
+        self.patterns[code] = pats
 
     def _compile_patterns(self) -> None:
         self.patterns = {}
-        for code, category in self.categories.items():
-            pats: List[Tuple[str, re.Pattern]] = []
-            for keyword in category.get_all_keywords():
-                escaped = re.escape(keyword.lower())
-                if " " in keyword:
-                    escaped = r"\s+".join(map(re.escape, keyword.lower().split()))
-                pattern_str = r"\b" + escaped + r"\b"
-                try:
-                    pats.append((keyword, re.compile(pattern_str, re.IGNORECASE)))
-                except re.error as e:
-                    logger.warning("Failed to compile pattern for '%s': %s", keyword, e)
-            self.patterns[code] = pats
+        for code in self.categories.keys():
+            self._compile_patterns_for_code(code)
 
-    # -------------------------------------------------------------------------
-    # SEMANTIC PRECOMPUTATION
-    # -------------------------------------------------------------------------
+    def _ensure_semantic_ready(self) -> None:
+        if self._semantic_ready:
+            return
+        self.semantic.ensure_loaded()
+        if self.semantic.model is None:
+            self._semantic_ready = True
+            return
+        self._precompute_semantic_embeddings()
+        self._semantic_ready = True
 
     def _precompute_semantic_embeddings(self) -> None:
         self._sem_pos_emb.clear()
         self._sem_neg_emb.clear()
         self._sem_pos_texts.clear()
         self._sem_neg_texts.clear()
-
-        if self.semantic.model is None:
-            return
 
         for code, cat in self.categories.items():
             pos = [t.strip() for t in (cat.semantic_positive or []) if t and t.strip()]
@@ -1107,9 +1287,714 @@ class HybridMarporAnalyzer:
                 if emb is not None and len(emb) == len(neg):
                     self._sem_neg_emb[code] = emb
 
-    # -------------------------------------------------------------------------
-    # BREAKDOWN (VALIDATED evidence only; no new evidence created)
-    # -------------------------------------------------------------------------
+    def _is_non_substantive(self, text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return True
+
+        if len(t) <= 120 and self._CEREMONIAL_RE.search(t):
+            if self._ACTION_MARKER_RE.search(t):
+                return False
+            return True
+
+        words = re.findall(r"[A-Za-z]{2,}", t)
+        if len(words) <= 3 and self._CEREMONIAL_RE.search(t):
+            return True
+        return False
+
+    def _compute_2d_axes(self, validated_ideol: List[Evidence], *, axis_min_total: float) -> Dict[str, Any]:
+        s_lib = 0.0
+        s_auth = 0.0
+        e_left = 0.0
+        e_right = 0.0
+
+        for ev in validated_ideol:
+            cat = self.categories.get(ev.code)
+            if not cat:
+                continue
+
+            polm = _axis_pol_mult(int(ev.polarity))
+            base = float(ev.strength)
+
+            if float(cat.social_weight) > 0.0 and float(cat.social_tendency) != 0.0:
+                contrib = base * float(cat.social_weight) * abs(float(cat.social_tendency)) * polm
+                if cat.social_tendency > 0:
+                    s_lib += contrib
+                else:
+                    s_auth += contrib
+
+            if float(cat.economic_weight) > 0.0 and float(cat.economic_tendency) != 0.0:
+                contrib = base * float(cat.economic_weight) * abs(float(cat.economic_tendency)) * polm
+                if cat.economic_tendency > 0:
+                    e_right += contrib
+                else:
+                    e_left += contrib
+
+        social_total = s_lib + s_auth
+        econ_total = e_left + e_right
+
+        social_coord = _coord_from_masses(s_lib, s_auth)
+        econ_coord = _coord_from_masses(e_right, e_left)
+
+        social_conf = _axis_confidence(s_lib, s_auth) if social_total >= axis_min_total else 0.0
+        econ_conf = _axis_confidence(e_right, e_left) if econ_total >= axis_min_total else 0.0
+        overall_conf = float(_clamp((social_conf + econ_conf) / 2.0, 0.0, 1.0))
+
+        magnitude = float(math.sqrt((social_coord ** 2) + (econ_coord ** 2)))
+
+        axis_strengths = {
+            "social": {
+                "libertarian": float(round(s_lib, 6)),
+                "authoritarian": float(round(s_auth, 6)),
+                "total": float(round(social_total, 6)),
+            },
+            "economic": {
+                "left": float(round(e_left, 6)),
+                "right": float(round(e_right, 6)),
+                "total": float(round(econ_total, 6)),
+            },
+        }
+
+        return {
+            "axis_labels": _axis_labels_block(),
+            "axis_strengths": axis_strengths,
+            "coordinates": {
+                "social": float(round(social_coord, 3)),
+                "economic": float(round(econ_coord, 3)),
+            },
+            "coordinates_xy": {
+                "x": float(round(econ_coord, 3)),
+                "y": float(round(social_coord, 3)),
+            },
+            "confidence_2d": {
+                "social": float(round(social_conf, 3)),
+                "economic": float(round(econ_conf, 3)),
+                "overall": float(round(overall_conf, 3)),
+            },
+            "confidence": {
+                "social": float(round(social_conf, 3)),
+                "economic": float(round(econ_conf, 3)),
+                "overall": float(round(overall_conf, 3)),
+            },
+            "quadrant_2d": {
+                "magnitude": float(round(magnitude, 3)),
+                "axis_directions": _axis_directions_from_masses(
+                    s_lib=s_lib, s_auth=s_auth, e_left=e_left, e_right=e_right, axis_min_total=axis_min_total
+                ),
+            },
+        }
+
+    @staticmethod
+    def _primary_family_from_axes(axes2d: Dict[str, Any], *, axis_min_total: float) -> str:
+        axis = (axes2d.get("axis_strengths") or {}) if isinstance(axes2d, dict) else {}
+        soc = axis.get("social") or {}
+        eco = axis.get("economic") or {}
+
+        s_total = float(soc.get("total", 0.0) or 0.0)
+        e_total = float(eco.get("total", 0.0) or 0.0)
+
+        s_lib = float(soc.get("libertarian", 0.0) or 0.0)
+        s_auth = float(soc.get("authoritarian", 0.0) or 0.0)
+        e_left = float(eco.get("left", 0.0) or 0.0)
+        e_right = float(eco.get("right", 0.0) or 0.0)
+
+        if s_total >= axis_min_total:
+            return LIB_FAMILY if s_lib >= s_auth else AUTH_FAMILY
+        if e_total >= axis_min_total:
+            return ECON_RIGHT if e_right >= e_left else ECON_LEFT
+        return CENTRIST_FAMILY
+
+    @staticmethod
+    def _axis_dominance_for_family(axes2d: Dict[str, Any], family: str) -> float:
+        axis = axes2d.get("axis_strengths", {}) or {}
+        soc = axis.get("social", {}) or {}
+        eco = axis.get("economic", {}) or {}
+
+        s_lib = float(soc.get("libertarian", 0.0) or 0.0)
+        s_auth = float(soc.get("authoritarian", 0.0) or 0.0)
+        e_left = float(eco.get("left", 0.0) or 0.0)
+        e_right = float(eco.get("right", 0.0) or 0.0)
+
+        if family in (LIB_FAMILY, AUTH_FAMILY):
+            return float(_dominance(s_lib, s_auth))
+        if family in (ECON_LEFT, ECON_RIGHT):
+            return float(_dominance(e_left, e_right))
+        return 0.0
+
+    @staticmethod
+    def _is_ideology_evidence_any_axis(
+        *,
+        evidence_count: int,
+        topic_count: int,
+        total_strength: float,
+        axis_dom: float,
+        family: str,
+        axes2d: Dict[str, Any],
+        evidence_min_total_strength: float,
+        evidence_min_axis_dom: float,
+        axis_min_total: float,
+    ) -> bool:
+        if family == CENTRIST_FAMILY:
+            return False
+        if evidence_count < EVIDENCE_MIN_EVIDENCE_COUNT:
+            return False
+        if topic_count < EVIDENCE_MIN_TOPIC_COUNT:
+            return False
+        if total_strength < evidence_min_total_strength:
+            return False
+        if axis_dom < evidence_min_axis_dom:
+            return False
+
+        axis = axes2d.get("axis_strengths", {}) or {}
+        soc_total = float((axis.get("social", {}) or {}).get("total", 0.0) or 0.0)
+        eco_total = float((axis.get("economic", {}) or {}).get("total", 0.0) or 0.0)
+
+        if soc_total < axis_min_total and eco_total < axis_min_total:
+            return False
+
+        return True
+
+    def classify_text_detailed(self, text: str, use_semantic: bool = True, threshold: float = 0.6) -> Dict[str, Any]:
+        text = (text or "").strip()
+        if not text or self._is_non_substantive(text):
+            out = self._empty_result()
+            out["analysis_mode"] = "empty_or_ceremonial"
+            out["timestamp"] = _utc_now_iso()
+            return out
+
+        total_chars = len(text)
+
+        scale = _threshold_scale(float(threshold))
+        keep_min = float(_clamp(MIN_EVIDENCE_STRENGTH_KEEP * scale, 0.08, 0.45))
+        axis_min_total = float(_clamp(AXIS_MIN_TOTAL * scale, 0.08, 0.25))
+        evidence_min_total_strength = float(_clamp(EVIDENCE_MIN_TOTAL_STRENGTH * scale, 0.10, 0.50))
+        evidence_min_axis_dom = float(_clamp(EVIDENCE_MIN_AXIS_DOMINANCE * scale, 0.30, 0.55))
+
+        lexical_evidence, lexical_max = self._find_lexical_evidence(text, total_chars=total_chars)
+        lexical_validated = self._validate_evidence_with_context(
+            text,
+            lexical_evidence,
+            total_chars=total_chars,
+            keep_threshold=keep_min,
+        )
+
+        lexical_out = self._build_final_result(
+            text,
+            lexical_validated,
+            axis_min_total=axis_min_total,
+            evidence_min_total_strength=evidence_min_total_strength,
+            evidence_min_axis_dom=evidence_min_axis_dom,
+        )
+        if bool(lexical_out.get("is_ideology_evidence", False)):
+            lexical_out.setdefault("analysis_mode", "lexical_only")
+            return lexical_out
+
+        if not use_semantic:
+            lexical_out.setdefault("analysis_mode", "lexical_only")
+            return lexical_out
+
+        self._ensure_semantic_ready()
+        if self.semantic.model is None:
+            lexical_out.setdefault("analysis_mode", "lexical_only_semantic_unavailable")
+            return lexical_out
+
+        semantic_only = self._find_semantic_evidence_only(
+            text,
+            lexical_max_strength=lexical_max,
+            total_chars=total_chars,
+        )
+        combined = list(lexical_evidence) + list(semantic_only)
+        combined_validated = self._validate_evidence_with_context(
+            text,
+            combined,
+            total_chars=total_chars,
+            keep_threshold=keep_min,
+        )
+
+        semantic_out = self._build_final_result(
+            text,
+            combined_validated,
+            axis_min_total=axis_min_total,
+            evidence_min_total_strength=evidence_min_total_strength,
+            evidence_min_axis_dom=evidence_min_axis_dom,
+        )
+        semantic_out.setdefault("analysis_mode", "lexical_plus_semantic_fallback")
+        return semantic_out
+
+    def _find_lexical_evidence(self, text: str, *, total_chars: int) -> Tuple[List[Evidence], Dict[str, float]]:
+        evidence: List[Evidence] = []
+        text_lower = text.lower()
+        lexical_max_strength: Dict[str, float] = defaultdict(float)
+
+        for code, patterns in self.patterns.items():
+            cat = self.categories[code]
+            for keyword, pattern in patterns:
+                for m in pattern.finditer(text):
+                    if cat.anti_patterns:
+                        window = text_lower[m.start() : min(len(text_lower), m.end() + 60)]
+                        if any((anti and anti.lower() in window) for anti in cat.anti_patterns):
+                            continue
+
+                    match_type = "lexical_primary" if keyword in cat.primary_keywords else "lexical_secondary"
+                    base = self.weights.get_evidence_quality(match_type)
+                    lexical_max_strength[code] = max(float(lexical_max_strength[code]), float(base))
+
+                    matched_text = text[m.start() : m.end()]
+
+                    evidence.append(
+                        Evidence(
+                            code=code,
+                            matched_text=matched_text,
+                            span=(m.start(), m.end()),
+                            match_type=match_type,
+                            base_strength=float(base),
+                            strength=float(base),
+                            polarity=0,
+                            polarity_reason="pending",
+                            inside_quotes=self._is_inside_quotes(text, m.start()),
+                        )
+                    )
+
+        return evidence, dict(lexical_max_strength)
+
+    def _find_semantic_evidence_only(
+        self,
+        text: str,
+        *,
+        lexical_max_strength: Dict[str, float],
+        total_chars: int,
+    ) -> List[Evidence]:
+        self._ensure_semantic_ready()
+        if self.semantic.model is None:
+            return []
+
+        text_emb = self.semantic.encode_one(text)
+        if text_emb is None:
+            return []
+
+        evidence: List[Evidence] = []
+
+        for code, cat in self.categories.items():
+            if float(lexical_max_strength.get(code, 0.0)) >= SEMANTIC_LEXICAL_OVERRIDE:
+                continue
+
+            pos_emb = self._sem_pos_emb.get(code)
+            neg_emb = self._sem_neg_emb.get(code)
+            pos_texts = self._sem_pos_texts.get(code, [])
+            neg_texts = self._sem_neg_texts.get(code, [])
+
+            if (pos_emb is None or len(pos_texts) == 0) and (neg_emb is None or len(neg_texts) == 0):
+                continue
+
+            best_pos = None
+            second_pos = None
+            best_pos_text = None
+            if pos_emb is not None and getattr(pos_emb, "shape", (0,))[0] > 0:
+                sims = self.semantic.cosine_similarity_matrix(text_emb, pos_emb)
+                if sims is not None and getattr(sims, "size", 0) > 0:
+                    topk_idx = np.argsort(sims)[::-1][: max(1, min(SEMANTIC_TOPK, int(sims.size)))]
+                    topk_vals = sims[topk_idx]
+                    best_pos = float(topk_vals[0])
+                    second_pos = float(topk_vals[1]) if len(topk_vals) > 1 else float(-1.0)
+                    best_pos_text = pos_texts[int(topk_idx[0])] if int(topk_idx[0]) < len(pos_texts) else None
+
+            best_neg = None
+            second_neg = None
+            best_neg_text = None
+            if neg_emb is not None and getattr(neg_emb, "shape", (0,))[0] > 0:
+                sims = self.semantic.cosine_similarity_matrix(text_emb, neg_emb)
+                if sims is not None and getattr(sims, "size", 0) > 0:
+                    topk_idx = np.argsort(sims)[::-1][: max(1, min(SEMANTIC_TOPK, int(sims.size)))]
+                    topk_vals = sims[topk_idx]
+                    best_neg = float(topk_vals[0])
+                    second_neg = float(topk_vals[1]) if len(topk_vals) > 1 else float(-1.0)
+                    best_neg_text = neg_texts[int(topk_idx[0])] if int(topk_idx[0]) < len(neg_texts) else None
+
+            chosen_polarity = 0
+            chosen_sim = None
+            chosen_example = None
+            chosen_reason = None
+
+            if (
+                best_neg is not None
+                and best_neg >= SEMANTIC_NEG_THRESHOLD
+                and (best_neg - float(second_neg or -1.0)) >= SEMANTIC_MARGIN
+            ):
+                if best_pos is None or best_neg >= (best_pos + SEMANTIC_MARGIN):
+                    chosen_polarity = -1
+                    chosen_sim = best_neg
+                    chosen_example = best_neg_text
+                    chosen_reason = "semantic_oppose"
+
+            if (
+                chosen_polarity == 0
+                and best_pos is not None
+                and best_pos >= SEMANTIC_THRESHOLD
+                and (best_pos - float(second_pos or -1.0)) >= SEMANTIC_MARGIN
+            ):
+                chosen_polarity = 1
+                chosen_sim = best_pos
+                chosen_example = best_pos_text
+                chosen_reason = "semantic_support"
+
+            if chosen_polarity == 0 or chosen_sim is None:
+                continue
+
+            base_q = self.weights.get_evidence_quality("semantic", chosen_sim)
+            strength = float(base_q) * float(chosen_sim)
+
+            evidence.append(
+                Evidence(
+                    code=code,
+                    matched_text=f"[Semantic: {(chosen_example or '')[:80]}...]",
+                    span=(0, len(text)),
+                    match_type="semantic",
+                    base_strength=float(base_q),
+                    strength=float(strength),
+                    polarity=int(chosen_polarity),
+                    polarity_reason=str(chosen_reason),
+                    inside_quotes=False,
+                    semantic_similarity=float(chosen_sim),
+                )
+            )
+
+        return evidence
+
+    def _validate_evidence_with_context(
+        self,
+        text: str,
+        evidence: List[Evidence],
+        *,
+        total_chars: int,
+        keep_threshold: float,
+    ) -> List[Evidence]:
+        text_lower = text.lower()
+        validated: List[Evidence] = []
+
+        for ev in evidence:
+            cat = self.categories.get(ev.code)
+            if not cat:
+                continue
+
+            out = Evidence(**ev.__dict__)
+
+            if cat.requires_context:
+                hits = [c for c in cat.requires_context if c and c.lower() in text_lower]
+                misses = [c for c in cat.requires_context if c and c.lower() not in text_lower]
+                out.context_hits = hits
+                out.context_misses = misses
+
+                if cat.requires_context_hard and out.match_type.startswith("lexical") and not hits:
+                    continue
+
+                if hits:
+                    out.strength *= self.weights.CONTEXT_REQUIRED_MET
+                if misses:
+                    out.strength *= self.weights.CONTEXT_REQUIRED_MISSED
+
+            if cat.excludes_context:
+                for excluded in cat.excludes_context:
+                    if excluded and excluded.lower() in text_lower:
+                        out.strength *= self.weights.CONTEXT_EXCLUDED_PRESENT
+                        out.context_misses.append(f"excluded:{excluded}")
+                        break
+
+            if out.polarity == 0:
+                pol, reason = self._detect_polarity(text, out)
+                out.polarity = int(pol)
+                out.polarity_reason = str(reason)
+
+            if out.polarity < 0:
+                out.strength *= self.weights.OPPOSE_STRENGTH
+            elif out.polarity == 0:
+                out.strength *= self.weights.NEUTRAL_STRENGTH
+            else:
+                out.strength *= self.weights.SUPPORT_STRENGTH
+
+            out.strength *= (self.weights.INSIDE_QUOTES if out.inside_quotes else self.weights.OUTSIDE_QUOTES)
+            out.strength *= float(cat.weight)
+
+            attr_hint, attr_reason = self._detect_attribution_hint(text, out)
+            out.attribution_hint = bool(attr_hint)
+            out.attribution_reason = attr_reason
+
+            out.strength = float(min(1.0, max(0.0, out.strength)))
+            if out.strength < float(keep_threshold):
+                continue
+
+            out.evidence_confidence = self.conf_calc.calculate_evidence_confidence(
+                match_type=out.match_type,
+                similarity=out.semantic_similarity,
+                context_hits=len(out.context_hits),
+                context_misses=len(out.context_misses),
+                inside_quotes=out.inside_quotes,
+                polarity=out.polarity,
+                char_position=int(out.span[0]),
+                total_chars=int(total_chars),
+            )
+
+            validated.append(out)
+
+        return validated
+
+    def _detect_polarity(self, text: str, evidence: Evidence) -> Tuple[int, str]:
+        text_lower = text.lower()
+        window = 90
+        start = max(0, evidence.span[0] - window)
+        end = min(len(text), evidence.span[1] + window)
+        ctx = text_lower[start:end]
+
+        for pat in self.opposition_patterns:
+            if pat.search(ctx):
+                return -1, f"opposition:{pat.pattern[:24]}"
+
+        for pat in self.negation_patterns:
+            for m in pat.finditer(ctx):
+                distance = abs(m.start() - (evidence.span[0] - start))
+                if distance < 60:
+                    return -1, f"negation:{pat.pattern[:24]}"
+
+        for pat in self.endorsement_patterns:
+            if pat.search(ctx):
+                return 1, f"support:{pat.pattern[:24]}"
+
+        if evidence.match_type == "semantic" and evidence.polarity != 0:
+            return evidence.polarity, evidence.polarity_reason or "semantic_assigned"
+
+        return 0, "neutral_or_ambiguous"
+
+    def _detect_attribution_hint(self, text: str, evidence: Evidence) -> Tuple[bool, Optional[str]]:
+        text_lower = text.lower()
+        window = 140
+        start = max(0, evidence.span[0] - window)
+        end = min(len(text), evidence.span[1] + window)
+        ctx = text_lower[start:end]
+
+        if evidence.inside_quotes:
+            for pat in self.attribution_patterns:
+                m = pat.search(ctx)
+                if m:
+                    return True, f"quoted_attribution:{pat.pattern[:32]}"
+
+        for pat in self.attribution_patterns:
+            m = pat.search(ctx)
+            if m:
+                return True, f"context_attribution:{pat.pattern[:32]}"
+
+        return False, None
+
+    @staticmethod
+    def _is_inside_quotes(text: str, position: int) -> bool:
+        qchars = {'"', "\u201c", "\u201d", "\u00ab", "\u00bb"}
+        inside = False
+        for ch in text[: max(0, position)]:
+            if ch in qchars:
+                inside = not inside
+        return inside
+
+    def _determine_subtype_evidence_level(
+        self,
+        code_strengths: Dict[str, float],
+        evidence_codes: List[str],
+        family: str,
+    ) -> Optional[str]:
+        fam_l = (family or "").strip().lower()
+        if fam_l not in ("libertarian", "authoritarian"):
+            return None
+
+        def belongs(subtype_name: str) -> bool:
+            s = (subtype_name or "").lower()
+            return ("libertarian" in s) if fam_l == "libertarian" else ("authoritarian" in s)
+
+        best_subtype: Optional[str] = None
+        best_pc: float = 0.0
+        best_strength: float = 0.0
+
+        for subtype, subtype_codes in IDEOLOGY_SUBTYPES.items():
+            if not belongs(subtype):
+                continue
+
+            total_s = float(sum(float(code_strengths.get(c, 0.0)) for c in subtype_codes))
+            if total_s <= 0.0:
+                continue
+
+            pc = EvidenceConfidence.calculate_pattern_confidence_single(
+                evidence_codes=evidence_codes,
+                subtype_codes=subtype_codes,
+            )
+            pc_val = float(pc.get("pattern_confidence", 0.0) or 0.0)
+
+            if (pc_val > best_pc + 1e-9) or (abs(pc_val - best_pc) < 1e-9 and total_s > best_strength):
+                best_subtype = subtype
+                best_pc = pc_val
+                best_strength = total_s
+
+        return best_subtype
+
+    def _build_final_result(
+        self,
+        text: str,
+        validated_all: List[Evidence],
+        *,
+        axis_min_total: float,
+        evidence_min_total_strength: float,
+        evidence_min_axis_dom: float,
+    ) -> Dict[str, Any]:
+        if not validated_all:
+            out = self._empty_result()
+            out["analysis_mode"] = "empty"
+            out["timestamp"] = _utc_now_iso()
+            return out
+
+        validated_ideol: List[Evidence] = []
+        validated_centrist: List[Evidence] = []
+
+        for ev in validated_all:
+            cat = self.categories.get(ev.code)
+            if not cat:
+                continue
+            if cat.tendency == "centrist":
+                validated_centrist.append(ev)
+            else:
+                validated_ideol.append(ev)
+
+        centrist_strength = float(sum(float(e.strength) for e in validated_centrist))
+
+        if not validated_ideol:
+            out = self._empty_result()
+            out["centrist_box"] = {
+                "evidence": self._serialize_evidence(validated_centrist),
+                "evidence_count": int(len(validated_centrist)),
+                "marpor_codes": sorted(set(ev.code for ev in validated_centrist)),
+                "marpor_breakdown": self._build_marpor_breakdown_from_validated(validated_centrist),
+                "total_strength": float(centrist_strength),
+            }
+            out["jargon_box"] = dict(out["centrist_box"])
+            out["analysis_mode"] = "centrist_only"
+            out["timestamp"] = _utc_now_iso()
+            return out
+
+        axes2d = self._compute_2d_axes(validated_ideol, axis_min_total=axis_min_total)
+
+        family = self._primary_family_from_axes(axes2d, axis_min_total=axis_min_total)
+        axis_dom = self._axis_dominance_for_family(axes2d, family)
+
+        evidence_count = len(validated_ideol)
+        topic_count = len(set(ev.code for ev in validated_ideol))
+        marpor_codes = sorted(set(ev.code for ev in validated_ideol))
+        total_strength = float(sum(float(ev.strength) for ev in validated_ideol))
+
+        is_ev = self._is_ideology_evidence_any_axis(
+            evidence_count=evidence_count,
+            topic_count=topic_count,
+            total_strength=total_strength,
+            axis_dom=axis_dom,
+            family=family,
+            axes2d=axes2d,
+            evidence_min_total_strength=evidence_min_total_strength,
+            evidence_min_axis_dom=evidence_min_axis_dom,
+            axis_min_total=axis_min_total,
+        )
+
+        axis = axes2d.get("axis_strengths", {}) or {}
+        soc_total = float((axis.get("social", {}) or {}).get("total", 0.0) or 0.0)
+        eco_total = float((axis.get("economic", {}) or {}).get("total", 0.0) or 0.0)
+        is_ev_2d = bool((soc_total >= axis_min_total) or (eco_total >= axis_min_total))
+
+        subtype: Optional[str] = None
+        code_strengths: DefaultDict[str, float] = defaultdict(float)
+        for ev in validated_ideol:
+            pol_w = 1.0 if ev.polarity > 0 else (0.7 if ev.polarity == 0 else 0.4)
+            code_strengths[ev.code] += float(ev.strength) * pol_w
+
+        if family in (LIB_FAMILY, AUTH_FAMILY):
+            subtype = self._determine_subtype_evidence_level(
+                code_strengths=dict(code_strengths),
+                evidence_codes=marpor_codes,
+                family=family,
+            )
+
+        pattern_conf: Dict[str, Any] = {}
+        if subtype:
+            subtype_codes = IDEOLOGY_SUBTYPES.get(subtype, [])
+            if subtype_codes:
+                pattern_conf = self.conf_calc.calculate_pattern_confidence_single(
+                    evidence_codes=marpor_codes,
+                    subtype_codes=subtype_codes,
+                )
+
+        avg_ev_conf = (
+            sum(float((ev.evidence_confidence or {}).get("evidence_confidence", 0.0)) for ev in validated_ideol)
+            / max(1, len(validated_ideol))
+        )
+        confidence_score = float(min(1.0, max(0.0, avg_ev_conf * (0.6 + 0.4 * axis_dom))))
+
+        signal_strength = float((1.0 - math.exp(-max(0.0, total_strength))) * 100.0)
+        signal_strength = float(min(100.0, max(0.0, signal_strength)))
+
+        marpor_breakdown = self._build_marpor_breakdown_from_validated(validated_ideol)
+
+        soc = axis.get("social", {}) or {}
+        eco = axis.get("economic", {}) or {}
+
+        s_lib = float(soc.get("libertarian", 0.0) or 0.0)
+        s_auth = float(soc.get("authoritarian", 0.0) or 0.0)
+        e_left = float(eco.get("left", 0.0) or 0.0)
+        e_right = float(eco.get("right", 0.0) or 0.0)
+
+        total_mass = s_lib + s_auth + e_left + e_right
+        if total_mass > 0:
+            scores = {
+                LIB_FAMILY: round((s_lib / total_mass) * 100.0, 2),
+                AUTH_FAMILY: round((s_auth / total_mass) * 100.0, 2),
+                ECON_LEFT: round((e_left / total_mass) * 100.0, 2),
+                ECON_RIGHT: round((e_right / total_mass) * 100.0, 2),
+            }
+        else:
+            scores = {LIB_FAMILY: 0.0, AUTH_FAMILY: 0.0, ECON_LEFT: 0.0, ECON_RIGHT: 0.0}
+
+        return {
+            "ideology_family": family,
+            "ideology_subtype": subtype if family in (LIB_FAMILY, AUTH_FAMILY) else None,
+            "scores": scores,
+            "evidence": self._serialize_evidence(validated_ideol),
+            "evidence_count": int(evidence_count),
+            "support_evidence_count": int(sum(1 for ev in validated_ideol if ev.polarity > 0)),
+            "marpor_codes": marpor_codes,
+            "marpor_breakdown": marpor_breakdown,
+            "marpor_code_analysis": marpor_breakdown,
+            "total_evidence_strength": float(total_strength),
+            "axis_dominance": float(axis_dom),
+            "is_ideology_evidence": bool(is_ev),
+            "is_ideology_evidence_2d": bool(is_ev_2d),
+            "filtered_topic_count": int(topic_count),
+            "confidence_score": float(confidence_score),
+            "signal_strength": float(signal_strength),
+            "ideology_2d": axes2d,
+            "centrist_box": {
+                "evidence": self._serialize_evidence(validated_centrist),
+                "evidence_count": int(len(validated_centrist)),
+                "marpor_codes": sorted(set(ev.code for ev in validated_centrist)),
+                "marpor_breakdown": self._build_marpor_breakdown_from_validated(validated_centrist),
+                "total_strength": float(centrist_strength),
+            },
+            "jargon_box": {
+                "evidence": self._serialize_evidence(validated_centrist),
+                "evidence_count": int(len(validated_centrist)),
+                "marpor_codes": sorted(set(ev.code for ev in validated_centrist)),
+                "marpor_breakdown": self._build_marpor_breakdown_from_validated(validated_centrist),
+                "total_strength": float(centrist_strength),
+            },
+            "evidence_level_confidence": {
+                "avg_evidence_confidence": round(float(avg_ev_conf), 4),
+                "pattern_confidence": pattern_conf,
+                "evidence_quality": self._analyze_evidence_quality(validated_ideol),
+            },
+            "code_strengths": dict(code_strengths),
+            "analysis_level": "evidence_only",
+            "analysis_mode": "ideology_classified",
+            "timestamp": _utc_now_iso(),
+        }
 
     def _build_marpor_breakdown_from_validated(self, validated: List[Evidence]) -> Dict[str, Dict[str, Any]]:
         if not validated:
@@ -1135,7 +2020,7 @@ class HybridMarporAnalyzer:
             strength = float(strength_by_code.get(code, 0.0))
             pct = (strength / total_strength * 100.0) if total_strength > 0 else 0.0
 
-            polarity = {"support": 0, "oppose": 0, "centrist": 0}
+            polarity = {"support": 0, "oppose": 0, "neutral": 0}
             ev_conf: List[float] = []
             for e in evs:
                 if e.polarity > 0:
@@ -1143,11 +2028,8 @@ class HybridMarporAnalyzer:
                 elif e.polarity < 0:
                     polarity["oppose"] += 1
                 else:
-                    polarity["centrist"] += 1
-                try:
-                    ev_conf.append(float((e.evidence_confidence or {}).get("evidence_confidence", 0.0)))
-                except Exception:
-                    pass
+                    polarity["neutral"] += 1
+                ev_conf.append(float((e.evidence_confidence or {}).get("evidence_confidence", 0.0)))
 
             avg_ev_conf = (sum(ev_conf) / len(ev_conf)) if ev_conf else 0.0
             avg_strength = (sum(float(e.strength) for e in evs) / max(1, len(evs)))
@@ -1164,537 +2046,13 @@ class HybridMarporAnalyzer:
                 "avg_evidence_confidence": round(float(avg_ev_conf), 3),
                 "polarity": polarity,
                 "evidence_strength": round(float(strength), 6),
+                "social_tendency": float(cat.social_tendency),
+                "economic_tendency": float(cat.economic_tendency),
+                "social_weight": float(cat.social_weight),
+                "economic_weight": float(cat.economic_weight),
             }
 
         return dict(sorted(out.items(), key=lambda kv: kv[1]["percentage"], reverse=True))
-
-    # -------------------------------------------------------------------------
-    # PUBLIC API
-    # -------------------------------------------------------------------------
-
-    def classify_text_detailed(self, text: str, use_semantic: bool = True, threshold: float = 0.6) -> Dict[str, Any]:
-        # threshold is accepted for compatibility; gating is internal and stable.
-        text = (text or "").strip()
-        if not text:
-            return self._empty_result()
-
-        total_chars = len(text)
-
-        try:
-            evidence, lexical_max_strength = self._find_all_evidence(text, use_semantic=use_semantic, total_chars=total_chars)
-        except Exception as e:
-            logger.error("Evidence finding failed: %s", e, exc_info=True)
-            return self._empty_result()
-
-        try:
-            validated_all = self._validate_evidence_with_context(text, evidence, total_chars=total_chars)
-        except Exception as e:
-            logger.error("Evidence validation failed: %s", e, exc_info=True)
-            validated_all = []
-
-        if not validated_all:
-            return self._empty_result()
-
-        # Split validated evidence into ideological vs centrist discourse
-        validated_ideol: List[Evidence] = []
-        validated_centrist: List[Evidence] = []
-        for ev in validated_all:
-            cat = self.categories.get(ev.code)
-            if not cat:
-                continue
-            if cat.tendency == "centrist":
-                validated_centrist.append(ev)
-            else:
-                validated_ideol.append(ev)
-
-        # If no ideological evidence exists, classify as Centrist
-        if not validated_ideol:
-            centrist_breakdown = self._build_marpor_breakdown_from_validated(validated_centrist)
-            centrist_strength = float(sum(float(e.strength) for e in validated_centrist))
-            return self._centrist_result(validated_centrist, centrist_breakdown, centrist_strength)
-
-        # Compute ideological strengths (Lib/Auth only)
-        code_strengths: DefaultDict[str, float] = defaultdict(float)
-        lib_strength = 0.0
-        auth_strength = 0.0
-        centrist_strength = float(sum(float(e.strength) for e in validated_centrist))
-
-        for ev in validated_ideol:
-            cat = self.categories.get(ev.code)
-            if not cat:
-                continue
-
-            # polarity weighting for code_strengths bookkeeping
-            if ev.polarity > 0:
-                pol_w = 1.0
-            elif ev.polarity == 0:
-                pol_w = 0.7
-            else:
-                pol_w = 0.4
-            code_strengths[ev.code] += float(ev.strength) * pol_w
-
-            # family strength attribution (ideological only)
-            if cat.tendency == "libertarian":
-                if ev.polarity > 0:
-                    lib_strength += float(ev.strength)
-                elif ev.polarity < 0:
-                    auth_strength += float(ev.strength) * 0.8
-                else:
-                    lib_strength += float(ev.strength) * 0.35
-                    auth_strength += float(ev.strength) * 0.10
-
-            elif cat.tendency == "authoritarian":
-                if ev.polarity > 0:
-                    auth_strength += float(ev.strength)
-                elif ev.polarity < 0:
-                    lib_strength += float(ev.strength) * 0.8
-                else:
-                    auth_strength += float(ev.strength) * 0.35
-                    lib_strength += float(ev.strength) * 0.10
-
-        ideol_total_strength = lib_strength + auth_strength
-
-        dominance = 0.0
-        if ideol_total_strength > 0:
-            dominance = max(lib_strength, auth_strength) / ideol_total_strength
-
-        # Family decision (can still be Centrist if ideologically ambiguous / weak)
-        family = CENTRIST_FAMILY
-        if ideol_total_strength > 0:
-            margin = 0.12
-            lib_ratio = lib_strength / ideol_total_strength
-            auth_ratio = auth_strength / ideol_total_strength
-            if lib_ratio > auth_ratio + margin:
-                family = LIB_FAMILY
-            elif auth_ratio > lib_ratio + margin:
-                family = AUTH_FAMILY
-            else:
-                family = CENTRIST_FAMILY
-
-        evidence_count = len(validated_ideol)
-        support_evidence_count = sum(1 for ev in validated_ideol if ev.polarity > 0)
-        topic_count = len(set(ev.code for ev in validated_ideol))
-        marpor_codes = sorted(set(ev.code for ev in validated_ideol))
-
-        is_ev = self._is_ideology_evidence(
-            evidence_count=evidence_count,
-            topic_count=topic_count,
-            total_strength=ideol_total_strength,
-            dominance=dominance,
-            family=family,
-        )
-
-        # If gate fails, classify as Centrist (critical to block slogans / weak rhetoric)
-        if not is_ev:
-            centrist_breakdown = self._build_marpor_breakdown_from_validated(validated_centrist)
-            return self._centrist_result(validated_centrist, centrist_breakdown, centrist_strength)
-
-        subtype: Optional[str] = None
-        if family in (LIB_FAMILY, AUTH_FAMILY):
-            subtype = self._determine_subtype_evidence_level(dict(code_strengths), family)
-
-        pattern_conf: Dict[str, Any] = {}
-        if subtype:
-            subtype_codes = IDEOLOGY_SUBTYPES.get(subtype, [])
-            if subtype_codes:
-                pattern_conf = self.conf_calc.calculate_pattern_confidence_single(marpor_codes, subtype_codes)
-
-        avg_ev_conf = (
-            sum(float(ev.evidence_confidence.get("evidence_confidence", 0.0)) for ev in validated_ideol)
-            / max(1, len(validated_ideol))
-        )
-        confidence_score = float(min(1.0, max(0.0, avg_ev_conf * (0.6 + 0.4 * dominance))))
-
-        signal_strength = float((1.0 - math.exp(-max(0.0, ideol_total_strength))) * 100.0)
-        signal_strength = float(min(100.0, max(0.0, signal_strength)))
-
-        total_for_scores = lib_strength + auth_strength + centrist_strength
-        if total_for_scores > 0:
-            scores = {
-                LIB_FAMILY: round((lib_strength / total_for_scores) * 100.0, 2),
-                AUTH_FAMILY: round((auth_strength / total_for_scores) * 100.0, 2),
-                CENTRIST_FAMILY: round((centrist_strength / total_for_scores) * 100.0, 2),
-            }
-        else:
-            scores = {LIB_FAMILY: 0.0, AUTH_FAMILY: 0.0, CENTRIST_FAMILY: 100.0}
-
-        marpor_breakdown = self._build_marpor_breakdown_from_validated(validated_ideol)
-        centrist_breakdown = self._build_marpor_breakdown_from_validated(validated_centrist)
-
-        return {
-            "ideology_family": family,
-            "ideology_subtype": subtype,  # None for Centrist
-
-            "scores": scores,
-
-            # ideological evidence only
-            "evidence": self._serialize_evidence(validated_ideol),
-            "evidence_count": int(evidence_count),
-            "support_evidence_count": int(support_evidence_count),
-            "marpor_codes": marpor_codes,
-
-            "marpor_breakdown": marpor_breakdown,
-            "marpor_code_analysis": marpor_breakdown,
-
-            "total_evidence_strength": float(ideol_total_strength),
-            "libertarian_strength": float(lib_strength),
-            "authoritarian_strength": float(auth_strength),
-            "centrist_strength": float(centrist_strength),
-            "dominance": float(dominance),
-
-            "is_ideology_evidence": True,
-            "filtered_topic_count": int(topic_count),
-
-            "confidence_score": float(confidence_score),
-            "signal_strength": float(signal_strength),
-
-            # diagnostics: centrist discourse evidence (not ideology)
-            "centrist_evidence": self._serialize_evidence(validated_centrist),
-            "centrist_evidence_count": int(len(validated_centrist)),
-            "centrist_marpor_codes": sorted(set(ev.code for ev in validated_centrist)),
-            "centrist_marpor_breakdown": centrist_breakdown,
-
-            "evidence_level_confidence": {
-                "avg_evidence_confidence": round(float(avg_ev_conf), 4),
-                "pattern_confidence": pattern_conf,
-                "evidence_quality": self._analyze_evidence_quality(validated_ideol),
-            },
-
-            "code_strengths": dict(code_strengths),
-            "analysis_level": "evidence_only",
-            "timestamp": datetime.now().isoformat(),
-        }
-
-    # -------------------------------------------------------------------------
-    # IDEOLOGICAL EVIDENCE GATE (Centrist never passes)
-    # -------------------------------------------------------------------------
-
-    @staticmethod
-    def _is_ideology_evidence(*, evidence_count: int, topic_count: int, total_strength: float, dominance: float, family: str) -> bool:
-        if family == CENTRIST_FAMILY:
-            return False
-        if evidence_count < EVIDENCE_MIN_EVIDENCE_COUNT:
-            return False
-        if topic_count < EVIDENCE_MIN_TOPIC_COUNT:
-            return False
-        if total_strength < EVIDENCE_MIN_TOTAL_STRENGTH:
-            return False
-        if dominance < EVIDENCE_MIN_DOMINANCE:
-            return False
-        return True
-
-    def _centrist_result(
-        self,
-        validated_centrist: List[Evidence],
-        centrist_breakdown: Dict[str, Any],
-        centrist_strength: float,
-    ) -> Dict[str, Any]:
-        return {
-            "ideology_family": CENTRIST_FAMILY,
-            "ideology_subtype": None,
-            "scores": {LIB_FAMILY: 0.0, AUTH_FAMILY: 0.0, CENTRIST_FAMILY: 100.0},
-
-            "evidence": [],
-            "evidence_count": 0,
-            "support_evidence_count": 0,
-            "marpor_codes": [],
-
-            "marpor_breakdown": {},
-            "marpor_code_analysis": {},
-
-            "total_evidence_strength": 0.0,
-            "libertarian_strength": 0.0,
-            "authoritarian_strength": 0.0,
-            "centrist_strength": float(centrist_strength),
-            "dominance": 0.0,
-
-            "is_ideology_evidence": False,
-            "filtered_topic_count": 0,
-            "confidence_score": 0.0,
-            "signal_strength": 0.0,
-
-            "centrist_evidence": self._serialize_evidence(validated_centrist),
-            "centrist_evidence_count": int(len(validated_centrist)),
-            "centrist_marpor_codes": sorted(set(ev.code for ev in validated_centrist)),
-            "centrist_marpor_breakdown": centrist_breakdown,
-
-            "evidence_level_confidence": {
-                "avg_evidence_confidence": 0.0,
-                "pattern_confidence": {},
-                "evidence_quality": self._analyze_evidence_quality(validated_centrist),
-            },
-
-            "code_strengths": {},
-            "analysis_level": "evidence_only",
-            "timestamp": datetime.now().isoformat(),
-        }
-
-    # -------------------------------------------------------------------------
-    # EVIDENCE FINDING (lexical first, semantic selectively)
-    # -------------------------------------------------------------------------
-
-    def _find_all_evidence(
-        self,
-        text: str,
-        *,
-        use_semantic: bool,
-        total_chars: int,
-    ) -> Tuple[List[Evidence], Dict[str, float]]:
-        evidence: List[Evidence] = []
-        text_lower = text.lower()
-
-        lexical_max_strength: Dict[str, float] = defaultdict(float)
-
-        # Lexical hits
-        for code, patterns in self.patterns.items():
-            cat = self.categories[code]
-            for keyword, pattern in patterns:
-                try:
-                    for m in pattern.finditer(text_lower):
-                        # anti-pattern filter
-                        if cat.anti_patterns:
-                            window = text_lower[m.start(): min(len(text_lower), m.end() + 50)]
-                            if any((anti and anti.lower() in window) for anti in cat.anti_patterns):
-                                continue
-
-                        match_type = "lexical_primary" if keyword in cat.primary_keywords else "lexical_secondary"
-                        base = self.weights.get_evidence_quality(match_type)
-                        lexical_max_strength[code] = max(float(lexical_max_strength[code]), float(base))
-
-                        evidence.append(
-                            Evidence(
-                                code=code,
-                                matched_text=m.group(),
-                                span=(m.start(), m.end()),
-                                match_type=match_type,
-                                base_strength=float(base),
-                                strength=float(base),
-                                polarity=0,
-                                polarity_reason="pending",
-                                inside_quotes=self._is_inside_quotes(text, m.start()),
-                            )
-                        )
-                except Exception as e:
-                    logger.warning("Pattern matching failed for %s/%s: %s", code, keyword, e)
-
-        # Semantic hits (selective)
-        if not use_semantic or self.semantic.model is None:
-            return evidence, dict(lexical_max_strength)
-
-        text_emb = self.semantic.encode_one(text)
-        if text_emb is None:
-            return evidence, dict(lexical_max_strength)
-
-        for code, cat in self.categories.items():
-            if float(lexical_max_strength.get(code, 0.0)) >= SEMANTIC_LEXICAL_OVERRIDE:
-                continue
-
-            pos_emb = self._sem_pos_emb.get(code)
-            neg_emb = self._sem_neg_emb.get(code)
-            pos_texts = self._sem_pos_texts.get(code, [])
-            neg_texts = self._sem_neg_texts.get(code, [])
-
-            if (pos_emb is None or len(pos_texts) == 0) and (neg_emb is None or len(neg_texts) == 0):
-                continue
-
-            best_pos = None
-            second_pos = None
-            best_pos_text = None
-            if pos_emb is not None and pos_emb.shape[0] > 0:
-                sims = self.semantic.cosine_similarity_matrix(text_emb, pos_emb)
-                if sims.size > 0:
-                    topk_idx = np.argsort(sims)[::-1][: max(1, min(SEMANTIC_TOPK, sims.size))]
-                    topk_vals = sims[topk_idx]
-                    best_pos = float(topk_vals[0])
-                    second_pos = float(topk_vals[1]) if len(topk_vals) > 1 else float(-1.0)
-                    best_pos_text = pos_texts[int(topk_idx[0])] if int(topk_idx[0]) < len(pos_texts) else None
-
-            best_neg = None
-            second_neg = None
-            best_neg_text = None
-            if neg_emb is not None and neg_emb.shape[0] > 0:
-                sims = self.semantic.cosine_similarity_matrix(text_emb, neg_emb)
-                if sims.size > 0:
-                    topk_idx = np.argsort(sims)[::-1][: max(1, min(SEMANTIC_TOPK, sims.size))]
-                    topk_vals = sims[topk_idx]
-                    best_neg = float(topk_vals[0])
-                    second_neg = float(topk_vals[1]) if len(topk_vals) > 1 else float(-1.0)
-                    best_neg_text = neg_texts[int(topk_idx[0])] if int(topk_idx[0]) < len(neg_texts) else None
-
-            chosen_polarity = 0
-            chosen_sim = None
-            chosen_example = None
-            chosen_reason = None
-
-            if best_neg is not None and best_neg >= SEMANTIC_NEG_THRESHOLD and (best_neg - float(second_neg or -1.0)) >= SEMANTIC_MARGIN:
-                if best_pos is None or best_neg >= (best_pos + SEMANTIC_MARGIN):
-                    chosen_polarity = -1
-                    chosen_sim = best_neg
-                    chosen_example = best_neg_text
-                    chosen_reason = "semantic_oppose"
-
-            if chosen_polarity == 0 and best_pos is not None and best_pos >= SEMANTIC_THRESHOLD and (best_pos - float(second_pos or -1.0)) >= SEMANTIC_MARGIN:
-                chosen_polarity = 1
-                chosen_sim = best_pos
-                chosen_example = best_pos_text
-                chosen_reason = "semantic_support"
-
-            if chosen_polarity == 0 or chosen_sim is None:
-                continue
-
-            base_q = self.weights.get_evidence_quality("semantic", chosen_sim)
-            strength = float(base_q) * float(chosen_sim)
-
-            evidence.append(
-                Evidence(
-                    code=code,
-                    matched_text=f"[Semantic: {(chosen_example or '')[:70]}...]",
-                    span=(0, len(text)),
-                    match_type="semantic",
-                    base_strength=float(base_q),
-                    strength=float(strength),
-                    polarity=int(chosen_polarity),
-                    polarity_reason=str(chosen_reason),
-                    inside_quotes=False,
-                    semantic_similarity=float(chosen_sim),
-                )
-            )
-
-        return evidence, dict(lexical_max_strength)
-
-    # -------------------------------------------------------------------------
-    # EVIDENCE VALIDATION (context + polarity + confidence)
-    # -------------------------------------------------------------------------
-
-    def _validate_evidence_with_context(self, text: str, evidence: List[Evidence], *, total_chars: int) -> List[Evidence]:
-        text_lower = text.lower()
-        validated: List[Evidence] = []
-
-        for ev in evidence:
-            cat = self.categories.get(ev.code)
-            if not cat:
-                continue
-
-            out = Evidence(**ev.__dict__)
-
-            # Context validation
-            if cat.requires_context:
-                hits = [c for c in cat.requires_context if c and c.lower() in text_lower]
-                misses = [c for c in cat.requires_context if c and c.lower() not in text_lower]
-                out.context_hits = hits
-                out.context_misses = misses
-
-                # HARD context: discard lexical hits with zero context hits
-                if cat.requires_context_hard and out.match_type.startswith("lexical") and not hits:
-                    continue
-
-                if hits:
-                    out.strength *= self.weights.CONTEXT_REQUIRED_MET
-                if misses:
-                    out.strength *= self.weights.CONTEXT_REQUIRED_MISSED
-
-            if cat.excludes_context:
-                for excluded in cat.excludes_context:
-                    if excluded and excluded.lower() in text_lower:
-                        out.strength *= self.weights.CONTEXT_EXCLUDED_PRESENT
-                        out.context_misses.append(f"excluded:{excluded}")
-                        break
-
-            # Polarity detection (if not already assigned by semantic)
-            if out.polarity == 0:
-                pol, reason = self._detect_polarity(text, out)
-                out.polarity = int(pol)
-                out.polarity_reason = str(reason)
-
-            # Polarity strength modifier
-            if out.polarity < 0:
-                out.strength *= self.weights.OPPOSE_STRENGTH
-            elif out.polarity == 0:
-                out.strength *= self.weights.CENTRIST_STRENGTH
-            else:
-                out.strength *= self.weights.SUPPORT_STRENGTH
-
-            # Quote modifier + category weight
-            out.strength *= (self.weights.INSIDE_QUOTES if out.inside_quotes else self.weights.OUTSIDE_QUOTES)
-            out.strength *= float(cat.weight)
-
-            out.strength = float(min(1.0, max(0.0, out.strength)))
-            if out.strength <= MIN_EVIDENCE_STRENGTH_KEEP:
-                continue
-
-            out.evidence_confidence = self.conf_calc.calculate_evidence_confidence(
-                match_type=out.match_type,
-                similarity=out.semantic_similarity,
-                context_hits=len(out.context_hits),
-                context_misses=len(out.context_misses),
-                inside_quotes=out.inside_quotes,
-                polarity=out.polarity,
-                char_position=int(out.span[0]),
-                total_chars=int(total_chars),
-            )
-
-            validated.append(out)
-
-        return validated
-
-    def _detect_polarity(self, text: str, evidence: Evidence) -> Tuple[int, str]:
-        text_lower = text.lower()
-        window = 100
-        start = max(0, evidence.span[0] - window)
-        end = min(len(text), evidence.span[1] + window)
-        ctx = text_lower[start:end]
-
-        for pat in self.opposition_patterns:
-            if pat.search(ctx):
-                return -1, f"opposition:{pat.pattern[:24]}"
-
-        for pat in self.negation_patterns:
-            for m in pat.finditer(ctx):
-                if abs(m.start() - (evidence.span[0] - start)) < 80:
-                    return -1, f"negation:{pat.pattern[:24]}"
-
-        for pat in self.endorsement_patterns:
-            if pat.search(ctx):
-                return 1, f"support:{pat.pattern[:24]}"
-
-        if evidence.match_type == "semantic" and evidence.polarity != 0:
-            return evidence.polarity, evidence.polarity_reason or "semantic_assigned"
-
-        return 0, "centrist_or_ambiguous"
-
-    @staticmethod
-    def _is_inside_quotes(text: str, position: int) -> bool:
-        try:
-            before = text[:position]
-            q = before.count('"')
-            return (q % 2) == 1
-        except Exception:
-            return False
-
-    # -------------------------------------------------------------------------
-    # SUBTYPE DETERMINATION (IDEOLOGICAL ONLY)
-    # -------------------------------------------------------------------------
-
-    def _determine_subtype_evidence_level(self, code_strengths: Dict[str, float], family: str) -> str:
-        fam_l = (family or "").strip().lower()
-        if fam_l not in ("libertarian", "authoritarian"):
-            return family or CENTRIST_FAMILY
-
-        def belongs(subtype_name: str) -> bool:
-            s = (subtype_name or "").lower()
-            return ("libertarian" in s) if fam_l == "libertarian" else ("authoritarian" in s)
-
-        scores: Dict[str, float] = {}
-        for subtype, codes in IDEOLOGY_SUBTYPES.items():
-            if not belongs(subtype):
-                continue
-            scores[subtype] = sum(float(code_strengths.get(c, 0.0)) for c in codes)
-
-        return max(scores.items(), key=lambda x: x[1])[0] if scores else (family or CENTRIST_FAMILY)
-
-    # -------------------------------------------------------------------------
-    # QUALITY / SERIALIZATION / EMPTY
-    # -------------------------------------------------------------------------
 
     def _analyze_evidence_quality(self, evidence: List[Evidence]) -> Dict[str, Any]:
         if not evidence:
@@ -1719,12 +2077,12 @@ class HybridMarporAnalyzer:
         quality = (lexical_primary * 1.0 + lexical_secondary * 0.7 + len(semantic) * 0.8) / max(1, len(evidence))
 
         return {
-            "total_evidence": len(evidence),
-            "lexical_primary_count": lexical_primary,
-            "lexical_secondary_count": lexical_secondary,
-            "semantic_count": len(semantic),
-            "avg_semantic_similarity": round(avg_sem, 3),
-            "evidence_diversity": round(diversity, 3),
+            "total_evidence": int(len(evidence)),
+            "lexical_primary_count": int(lexical_primary),
+            "lexical_secondary_count": int(lexical_secondary),
+            "semantic_count": int(len(semantic)),
+            "avg_semantic_similarity": round(float(avg_sem), 3),
+            "evidence_diversity": round(float(diversity), 3),
             "quality_score": round(float(quality), 3),
         }
 
@@ -1732,19 +2090,24 @@ class HybridMarporAnalyzer:
     def _serialize_evidence(evidence: List[Evidence]) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for ev in evidence:
-            out.append({
-                "code": ev.code,
-                "matched_text": ev.matched_text,
-                "match_type": ev.match_type,
-                "strength": round(float(ev.strength), 3),
-                "polarity": int(ev.polarity),
-                "polarity_reason": ev.polarity_reason,
-                "inside_quotes": bool(ev.inside_quotes),
-                "semantic_similarity": round(float(ev.semantic_similarity), 3) if ev.semantic_similarity is not None else None,
-                "context_hits": list(ev.context_hits),
-                "context_misses": list(ev.context_misses),
-                "evidence_confidence": dict(ev.evidence_confidence or {}),
-            })
+            out.append(
+                {
+                    "code": str(ev.code),
+                    "matched_text": str(ev.matched_text),
+                    "span": [int(ev.span[0]), int(ev.span[1])],
+                    "match_type": str(ev.match_type),
+                    "strength": round(float(ev.strength), 3),
+                    "polarity": int(ev.polarity),
+                    "polarity_reason": str(ev.polarity_reason),
+                    "inside_quotes": bool(ev.inside_quotes),
+                    "semantic_similarity": round(float(ev.semantic_similarity), 3) if ev.semantic_similarity is not None else None,
+                    "context_hits": list(ev.context_hits),
+                    "context_misses": list(ev.context_misses),
+                    "evidence_confidence": dict(ev.evidence_confidence or {}),
+                    "attribution_hint": bool(getattr(ev, "attribution_hint", False)),
+                    "attribution_reason": getattr(ev, "attribution_reason", None),
+                }
+            )
         return out
 
     @staticmethod
@@ -1752,47 +2115,45 @@ class HybridMarporAnalyzer:
         return {
             "ideology_family": CENTRIST_FAMILY,
             "ideology_subtype": None,
-            "scores": {LIB_FAMILY: 0.0, AUTH_FAMILY: 0.0, CENTRIST_FAMILY: 100.0},
-
+            "scores": {LIB_FAMILY: 0.0, AUTH_FAMILY: 0.0, ECON_LEFT: 0.0, ECON_RIGHT: 0.0},
             "evidence": [],
             "evidence_count": 0,
             "support_evidence_count": 0,
             "marpor_codes": [],
-
             "marpor_breakdown": {},
             "marpor_code_analysis": {},
-
-            "centrist_evidence": [],
-            "centrist_evidence_count": 0,
-            "centrist_marpor_codes": [],
-            "centrist_marpor_breakdown": {},
-
             "total_evidence_strength": 0.0,
-            "libertarian_strength": 0.0,
-            "authoritarian_strength": 0.0,
-            "centrist_strength": 0.0,
-            "dominance": 0.0,
-
+            "axis_dominance": 0.0,
             "is_ideology_evidence": False,
+            "is_ideology_evidence_2d": False,
             "filtered_topic_count": 0,
             "confidence_score": 0.0,
             "signal_strength": 0.0,
-
+            "ideology_2d": {
+                "axis_labels": _axis_labels_block(),
+                "axis_strengths": {
+                    "social": {"libertarian": 0.0, "authoritarian": 0.0, "total": 0.0},
+                    "economic": {"left": 0.0, "right": 0.0, "total": 0.0},
+                },
+                "coordinates": {"social": 0.0, "economic": 0.0},
+                "coordinates_xy": {"x": 0.0, "y": 0.0},
+                "confidence_2d": {"social": 0.0, "economic": 0.0, "overall": 0.0},
+                "confidence": {"social": 0.0, "economic": 0.0, "overall": 0.0},
+                "quadrant_2d": {"magnitude": 0.0, "axis_directions": {"social": "", "economic": ""}},
+            },
+            "centrist_box": {"evidence": [], "evidence_count": 0, "marpor_codes": [], "marpor_breakdown": {}, "total_strength": 0.0},
+            "jargon_box": {"evidence": [], "evidence_count": 0, "marpor_codes": [], "marpor_breakdown": {}, "total_strength": 0.0},
             "evidence_level_confidence": {
                 "avg_evidence_confidence": 0.0,
                 "pattern_confidence": {},
                 "evidence_quality": {"total_evidence": 0},
             },
-
             "code_strengths": {},
             "analysis_level": "evidence_only",
-            "timestamp": datetime.now().isoformat(),
+            "analysis_mode": "empty",
+            "timestamp": _utc_now_iso(),
         }
 
-
-# =============================================================================
-# GLOBAL INSTANCE
-# =============================================================================
 
 hybrid_marpor_analyzer = HybridMarporAnalyzer()
 
@@ -1807,4 +2168,6 @@ __all__ = [
     "LIB_FAMILY",
     "AUTH_FAMILY",
     "CENTRIST_FAMILY",
+    "ECON_LEFT",
+    "ECON_RIGHT",
 ]

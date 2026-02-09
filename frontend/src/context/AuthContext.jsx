@@ -1,50 +1,40 @@
-// frontend/src/context/AuthContext.jsx
-import React, { createContext, useState, useContext, useEffect, useCallback } from "react";
-import {
-  authAPI,
-  listSpeeches,
-  getAccessToken,
-  setAuthTokens,
-  clearAuthTokens,
-} from "../services/api";
+import React, { createContext, useState, useContext, useEffect, useCallback, useMemo } from "react";
+import { authAPI, listSpeeches, getAccessToken, setAuthTokens, clearAuthTokens } from "../services/api";
 
-// Create the context
 export const AuthContext = createContext(null);
 
-// Hook for using the auth context
 export const useAuth = () => {
-  const context = useContext(AuthContext);
-  if (!context) throw new Error("useAuth must be used within AuthProvider");
-  return context;
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error("useAuth must be used within AuthProvider");
+  return ctx;
 };
 
 export const AuthProvider = ({ children }) => {
-  const [user, setUser] = useState(null);
+  const [user, setUser] = useState(() => {
+    try {
+      const stored = localStorage.getItem("user");
+      return stored ? JSON.parse(stored) : null;
+    } catch {
+      return null;
+    }
+  });
 
-  // token state is kept mainly for UI reactions; source of truth is localStorage
-  const [token, setToken] = useState(getAccessToken());
-
+  const [token, setToken] = useState(() => getAccessToken());
   const [loading, setLoading] = useState(true);
   const [userProjects, setUserProjects] = useState([]);
   const [loadingProjects, setLoadingProjects] = useState(false);
   const [authInitialized, setAuthInitialized] = useState(false);
 
-  const hardRedirectToLogin = () => {
+  const hardRedirectToLogin = useCallback(() => {
     window.location.href = "/login";
-  };
+  }, []);
 
   const logout = useCallback(async () => {
-    console.log("Logging out...");
-
-    // Clear local state immediately
     setToken(null);
     setUser(null);
     setUserProjects([]);
-
-    // Clear storage
     clearAuthTokens();
 
-    // Best effort: tell backend (ignore failures)
     try {
       await authAPI.logout();
     } catch (e) {
@@ -52,147 +42,107 @@ export const AuthProvider = ({ children }) => {
     }
 
     hardRedirectToLogin();
-  }, []);
+  }, [hardRedirectToLogin]);
 
   const loadUserProjects = useCallback(async () => {
     const t = getAccessToken();
-    if (!t) {
-      console.log("No valid token available, skipping project load");
-      return;
-    }
+    if (!t) return;
 
     setLoadingProjects(true);
     try {
       const speeches = await listSpeeches();
       setUserProjects(Array.isArray(speeches) ? speeches : []);
-      console.log("Projects loaded successfully:", Array.isArray(speeches) ? speeches.length : 0);
     } catch (error) {
-      console.error("Failed to load user projects:", error?.message || error);
-
       const msg = String(error?.message || "");
       if (
         msg.includes("Authentication") ||
         msg.includes("Session") ||
         msg.includes("401") ||
-        msg.includes("Could not validate credentials")
+        msg.includes("Could not validate credentials") ||
+        msg.includes("Unauthorized")
       ) {
         await logout();
+      } else {
+        setUserProjects([]);
       }
     } finally {
       setLoadingProjects(false);
     }
   }, [logout]);
 
-  // Initialize auth from localStorage
   useEffect(() => {
+    let cancelled = false;
+
     const initAuth = async () => {
-      const storedToken = getAccessToken();
-      const storedUser = localStorage.getItem("user");
+      try {
+        const storedToken = getAccessToken();
 
-      console.log("Initializing auth:", {
-        storedToken: Boolean(storedToken),
-        storedUser: Boolean(storedUser),
-      });
-
-      if (storedToken && storedUser) {
+        let storedUser = null;
         try {
-          const userData = JSON.parse(storedUser);
+          const u = localStorage.getItem("user");
+          storedUser = u ? JSON.parse(u) : null;
+        } catch {
+          storedUser = null;
+        }
 
-          // optimistic UI
-          setToken(storedToken);
-          setUser(userData);
+        if (storedToken) {
+          if (!cancelled) {
+            setToken(storedToken);
+            if (storedUser) setUser(storedUser);
+          }
 
-          // validate token against backend
           try {
-            console.log("Attempting to validate token...");
             const currentUser = await authAPI.getCurrentUser();
-            console.log("Token validation successful:", currentUser?.email || "ok");
+            const mergedUser = { ...(storedUser || {}), ...(currentUser || {}) };
+            localStorage.setItem("user", JSON.stringify(mergedUser));
 
-            const updatedUser = { ...userData, ...(currentUser || {}) };
-            localStorage.setItem("user", JSON.stringify(updatedUser));
-            setUser(updatedUser);
+            if (!cancelled) {
+              setUser(mergedUser);
+              setToken(getAccessToken());
+            }
 
             await loadUserProjects();
           } catch (error) {
-            console.error("Token validation failed:", error?.message || error);
-
-            // If access token invalid, try refresh once
             try {
-              console.log("Trying refresh token...");
               await authAPI.refreshToken();
-
               const refreshedUser = await authAPI.getCurrentUser();
               localStorage.setItem("user", JSON.stringify(refreshedUser));
-              setUser(refreshedUser);
-              setToken(getAccessToken());
+
+              if (!cancelled) {
+                setUser(refreshedUser);
+                setToken(getAccessToken());
+              }
 
               await loadUserProjects();
-            } catch (refreshErr) {
-              console.error("Refresh failed:", refreshErr?.message || refreshErr);
-              await logout();
+            } catch {
+              if (!cancelled) await logout();
               return;
             }
           }
-        } catch (error) {
-          console.error("Auth initialization failed:", error);
-          await logout();
-          return;
         }
-      } else {
-        console.log("No stored auth found");
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+          setAuthInitialized(true);
+        }
       }
-
-      setLoading(false);
-      setAuthInitialized(true);
     };
 
     initAuth();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
+    return () => {
+      cancelled = true;
+    };
   }, [loadUserProjects, logout]);
 
-  const login = async (credentials) => {
-    try {
-      console.log("Attempting login with credentials:", {
-        email: credentials?.email,
-        password: credentials?.password ? "***" : "missing",
-      });
+  const login = useCallback(
+    async (credentials) => {
+      try {
+        const response = await authAPI.login(credentials);
+        if (!response?.access_token || !response?.user) {
+          throw new Error("Invalid login response from server");
+        }
 
-      const response = await authAPI.login(credentials);
-
-      if (!response?.access_token || !response?.user) {
-        console.error("Invalid login response structure:", response);
-        throw new Error("Invalid login response from server");
-      }
-
-      // IMPORTANT: store both access + refresh token
-      setAuthTokens({
-        accessToken: response.access_token,
-        refreshToken: response.refresh_token || null,
-        user: response.user,
-      });
-
-      setToken(response.access_token);
-      setUser(response.user);
-
-      await loadUserProjects();
-
-      return { success: true, user: response.user };
-    } catch (error) {
-      console.error("Login failed:", error);
-      return {
-        success: false,
-        error: error?.message || "Login failed. Please check your credentials.",
-      };
-    }
-  };
-
-  const register = async (userData) => {
-    try {
-      console.log("Attempting registration...");
-      const response = await authAPI.register(userData);
-
-      // If backend auto-logins after register
-      if (response?.access_token && response?.user) {
         setAuthTokens({
           accessToken: response.access_token,
           refreshToken: response.refresh_token || null,
@@ -205,36 +155,57 @@ export const AuthProvider = ({ children }) => {
         await loadUserProjects();
 
         return { success: true, user: response.user };
+      } catch (error) {
+        return {
+          success: false,
+          error: error?.message || "Login failed. Please check your credentials.",
+        };
       }
+    },
+    [loadUserProjects]
+  );
 
-      // Fallback (no auto-login)
-      return { success: true, user: response?.user || null };
-    } catch (error) {
-      console.error("Registration failed:", error);
-      return {
-        success: false,
-        error: error?.message || "Registration failed. Please try again.",
-      };
-    }
-  };
+  const register = useCallback(
+    async (userData) => {
+      try {
+        const response = await authAPI.register(userData);
 
-  const updateUser = async (userData) => {
-    try {
-      return await new Promise((resolve) => {
-        setTimeout(() => {
-          const newUser = { ...(user || {}), ...(userData || {}) };
-          localStorage.setItem("user", JSON.stringify(newUser));
-          setUser(newUser);
-          resolve(newUser);
-        }, 300);
-      });
-    } catch (error) {
-      console.error("Update failed:", error);
-      throw error;
-    }
-  };
+        if (response?.access_token && response?.user) {
+          setAuthTokens({
+            accessToken: response.access_token,
+            refreshToken: response.refresh_token || null,
+            user: response.user,
+          });
 
-  const refreshUser = async () => {
+          setToken(response.access_token);
+          setUser(response.user);
+
+          await loadUserProjects();
+          return { success: true, user: response.user };
+        }
+
+        return { success: true, user: response?.user || null, message: response?.message };
+      } catch (error) {
+        return {
+          success: false,
+          error: error?.message || "Registration failed. Please try again.",
+        };
+      }
+    },
+    [loadUserProjects]
+  );
+
+  const updateUser = useCallback(
+    async (userData) => {
+      const next = { ...(user || {}), ...(userData || {}) };
+      localStorage.setItem("user", JSON.stringify(next));
+      setUser(next);
+      return next;
+    },
+    [user]
+  );
+
+  const refreshUser = useCallback(async () => {
     const t = getAccessToken();
     if (!t) return null;
 
@@ -244,9 +215,6 @@ export const AuthProvider = ({ children }) => {
       setUser(userData);
       return userData;
     } catch (error) {
-      console.error("Failed to refresh user:", error?.message || error);
-
-      // attempt refresh once, then retry
       try {
         await authAPI.refreshToken();
         const userData = await authAPI.getCurrentUser();
@@ -254,37 +222,52 @@ export const AuthProvider = ({ children }) => {
         setUser(userData);
         setToken(getAccessToken());
         return userData;
-      } catch (e) {
+      } catch {
         await logout();
         return null;
       }
     }
-  };
+  }, [logout]);
 
-  const refreshProjects = async () => {
+  const refreshProjects = useCallback(async () => {
     await loadUserProjects();
-  };
+  }, [loadUserProjects]);
 
-  const value = {
-    user,
-    token,
-    loading,
-    userProjects,
-    loadingProjects,
-    authInitialized,
-
-    login,
-    register,
-    logout,
-
-    updateUser,
-    refreshUser,
-    refreshProjects,
-
-    isAuthenticated: Boolean(getAccessToken()),
-    isAdmin: user?.role === "admin",
-    isPro: user?.subscription_tier === "pro" || user?.subscription_tier === "enterprise",
-  };
+  const value = useMemo(
+    () => ({
+      user,
+      token,
+      loading,
+      userProjects,
+      loadingProjects,
+      authInitialized,
+      login,
+      register,
+      logout,
+      updateUser,
+      refreshUser,
+      refreshProjects,
+      isAuthenticated: Boolean(getAccessToken()),
+      isAdmin: user?.role === "admin",
+      isPro: user?.subscription_tier === "pro" || user?.subscription_tier === "enterprise",
+    }),
+    [
+      user,
+      token,
+      loading,
+      userProjects,
+      loadingProjects,
+      authInitialized,
+      login,
+      register,
+      logout,
+      updateUser,
+      refreshUser,
+      refreshProjects,
+    ]
+  );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 };
+
+export default AuthContext;

@@ -1,12 +1,13 @@
 // frontend/src/App.jsx
-import React, { useEffect, useRef, useState } from "react";
-import { Routes, Route, useNavigate, useLocation, Navigate } from "react-router-dom";
+import React, { useEffect, useRef, useState, useCallback } from "react";
+import { BrowserRouter, Routes, Route, useNavigate, useLocation, Navigate } from "react-router-dom";
 
 import { AuthProvider, useAuth } from "./context/AuthContext";
 import AuthGuard from "./components/AuthGuard";
 import AppHeader from "./components/Header.jsx";
 import Sidebar from "./components/Sidebar.jsx";
 import UserProfile from "./components/UserProfile.jsx";
+
 import HomePage from "./pages/HomePage.jsx";
 import AboutPage from "./pages/AboutPage.jsx";
 import ComparisonPage from "./pages/ComparisonPage.jsx";
@@ -15,12 +16,12 @@ import CreateProjectPage from "./pages/CreateProjectPage.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
 import RegisterPage from "./pages/RegisterPage.jsx";
 import LandingPage from "./pages/LandingPage.jsx";
-
-import { listSpeeches, deleteSpeech, updateSpeech, isAuthenticated } from "./services/api";
 import TermsPage from "./pages/TermsPage";
 import PrivacyPage from "./pages/PrivacyPage";
 
-const AppContent = () => {
+import { listSpeechesAll, deleteSpeech, updateSpeech, isAuthenticated } from "./services/api";
+
+const AppShell = () => {
   const { user, loading, logout, authInitialized } = useAuth();
 
   const [projects, setProjects] = useState([]);
@@ -32,14 +33,12 @@ const AppContent = () => {
   const navigate = useNavigate();
   const location = useLocation();
 
-  // Prevent concurrent refresh calls (React StrictMode, rapid auth state changes, etc.)
   const refreshInFlightRef = useRef(false);
 
-  // Check if backend is accessible
   useEffect(() => {
     const checkBackend = async () => {
       try {
-        const base = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+        const base = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").replace(/\/+$/, "");
         const response = await fetch(`${base}/health`);
         setApiReady(Boolean(response.ok));
       } catch (error) {
@@ -51,7 +50,7 @@ const AppContent = () => {
     checkBackend();
   }, []);
 
-  const refreshProjects = async () => {
+  const refreshProjects = useCallback(async () => {
     if (!user || !authInitialized || !isAuthenticated() || !apiReady) return;
     if (refreshInFlightRef.current) return;
 
@@ -59,10 +58,9 @@ const AppContent = () => {
     setLoadingProjects(true);
 
     try {
-      // IMPORTANT: remove manual Promise.race timeout — axios timeout already exists
-      const speeches = await listSpeeches();
-
+      const speeches = await listSpeechesAll({ pageSize: 100 });
       const arr = Array.isArray(speeches) ? speeches : [];
+
       const mapped = arr.map((s) => ({
         ...s,
         title: s.title || "Untitled speech",
@@ -75,12 +73,7 @@ const AppContent = () => {
       console.error("Failed to load projects:", e?.message);
 
       const msg = String(e?.message || "");
-
-      if (
-        msg.includes("401") ||
-        msg.includes("Could not validate credentials") ||
-        msg.includes("Unauthorized")
-      ) {
+      if (msg.includes("401") || msg.includes("Could not validate credentials") || msg.includes("Unauthorized")) {
         logout();
         navigate("/login", { state: { message: "Session expired. Please log in again." } });
       } else {
@@ -90,15 +83,13 @@ const AppContent = () => {
       setLoadingProjects(false);
       refreshInFlightRef.current = false;
     }
-  };
+  }, [user, authInitialized, apiReady, logout, navigate]);
 
-  // Load projects only when all conditions are met
   useEffect(() => {
     const shouldLoadProjects = user && authInitialized && isAuthenticated() && apiReady;
     if (shouldLoadProjects) refreshProjects();
-  }, [user, authInitialized, apiReady]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [user, authInitialized, apiReady, refreshProjects]);
 
-  // Sync active project id with URL (/analysis/:id)
   useEffect(() => {
     const match = location.pathname.match(/^\/analysis\/(\d+)/);
     if (match && match[1]) {
@@ -159,7 +150,7 @@ const AppContent = () => {
   }
 
   if (!apiReady && !isPublicRoute) {
-    const base = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+    const base = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").replace(/\/+$/, "");
     return (
       <div className="flex items-center justify-center min-h-screen bg-gradient-to-br from-slate-50 via-blue-50 to-indigo-50">
         <div className="max-w-md p-8 bg-white rounded-xl shadow-lg border border-red-200">
@@ -185,10 +176,7 @@ const AppContent = () => {
                 No firewall is blocking the connection
               </li>
             </ul>
-            <button
-              onClick={() => window.location.reload()}
-              className="px-6 py-3 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700 transition-colors"
-            >
+            <button onClick={() => window.location.reload()} className="px-6 py-3 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-700 transition-colors" type="button">
               Retry Connection
             </button>
           </div>
@@ -205,7 +193,6 @@ const AppContent = () => {
         <Route path="/register" element={user ? <Navigate to="/" replace /> : <RegisterPage />} />
         <Route path="/terms" element={<TermsPage />} />
         <Route path="/privacy" element={<PrivacyPage />} />
-        <Route path="/" element={user ? <Navigate to="/" replace /> : <Navigate to="/landing" replace />} />
         <Route path="*" element={<Navigate to={user ? "/" : "/landing"} replace />} />
       </Routes>
     );
@@ -216,6 +203,7 @@ const AppContent = () => {
   return (
     <div className="h-screen flex flex-col">
       <AppHeader user={user} searchQuery={searchQuery} setSearchQuery={setSearchQuery} projects={projects} />
+
       <div className="flex flex-1 overflow-hidden">
         <Sidebar
           projects={projects}
@@ -228,6 +216,7 @@ const AppContent = () => {
           user={user}
           refreshProjects={refreshProjects}
         />
+
         <main className="flex-1 overflow-y-auto bg-gray-50 px-4 py-4 lg:px-6 lg:py-6">
           <Routes>
             <Route path="/" element={<HomePage />} />
@@ -273,6 +262,7 @@ const AppContent = () => {
 
             <Route path="/terms" element={<TermsPage />} />
             <Route path="/privacy" element={<PrivacyPage />} />
+
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </main>
@@ -283,7 +273,9 @@ const AppContent = () => {
 
 const App = () => (
   <AuthProvider>
-    <AppContent />
+    <BrowserRouter>
+      <AppShell />
+    </BrowserRouter>
   </AuthProvider>
 );
 

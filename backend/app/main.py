@@ -1,4 +1,3 @@
-# backend/app/main.py
 from __future__ import annotations
 
 import logging
@@ -14,7 +13,6 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-# Prefer Starlette's ProxyHeadersMiddleware if available; fall back to Uvicorn; else disable
 ProxyHeadersMiddleware = None
 try:
     from starlette.middleware.proxy_headers import ProxyHeadersMiddleware as _StarlettePHM  # type: ignore
@@ -28,21 +26,18 @@ except Exception:
     except Exception:
         ProxyHeadersMiddleware = None
 
-# Optional: restrict Host header in production (set your domains if you enable it)
-# from starlette.middleware.trustedhost import TrustedHostMiddleware
+from app.config import ensure_runtime_directories, settings
+from app.database.connection import (
+    check_database_health,
+    close_database_connections,
+    init_db,
+)
 
-from app.config import settings, ensure_runtime_directories
-from app.database import check_database_health, close_database_connections, init_db
-
-# Routers
 from app.api.routes.auth import router as auth_router
 from app.api.routes.users import router as users_router
 from app.api.routes.speeches import router as speeches_router
 from app.api.routes.analysis import router as analysis_router
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Logging setup
-# ───────────────────────────────────────────────────────────────────────────────
 LOG_LEVEL = settings.LOG_LEVEL.upper()
 LOG_FILE = settings.LOG_FILE or "./app.log"
 
@@ -57,68 +52,56 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Lifespan (startup/shutdown)
-# ───────────────────────────────────────────────────────────────────────────────
+
+def _init_confidence_calibration() -> None:
+    calib_path = os.getenv("CALIBRATOR_PATH", "calibration/calibrator.json")
+    try:
+        if not os.path.exists(calib_path):
+            logger.info("Confidence calibrator not found: %s", calib_path)
+            return
+
+        from app.services.evaluation.calibrate import IdeologyScoringCalibrator, load_calibrator
+        from app.services.ideology_scoring import configure_calibrator as configure_scoring_calibrator
+
+        adapter = load_calibrator(calib_path)
+        configure_scoring_calibrator(IdeologyScoringCalibrator(adapter))
+        logger.info("Confidence calibrator loaded: %s", calib_path)
+    except Exception as e:
+        logger.warning("Confidence calibration init failed: %s", e, exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("=" * 80)
-    logger.info("STARTING POLITICAL DISCOURSE ANALYSIS API")
-    logger.info("=" * 80)
     try:
-        # Create required runtime directories (uploads, chroma, media, etc.)
         ensure_runtime_directories()
-        # Also ensure public media mount exists if you keep it exposed
         os.makedirs("media/uploads", exist_ok=True)
-        logger.info("[ok] Required directories created/verified")
 
-        # Initialize DB
-        logger.info("Initializing database...")
         init_db()
-        logger.info("[ok] Database initialized")
 
-        # DB health check
         health = check_database_health()
-        if health.get("status") == "healthy":
-            logger.info("[ok] Database health check passed")
-            logger.info("  - Database: %s", health.get("database", "Unknown"))
-            logger.info("  - Version: %s", health.get("version", "Unknown"))
-            logger.info("  - Response time: %s", health.get("response_time", "Unknown"))
-        else:
+        if health.get("status") != "healthy":
             logger.error("Database health check failed: %s", health.get("error"))
 
-        # Non-sensitive config echo
-        logger.info("Configuration:")
-        logger.info("  - Environment: %s", settings.ENVIRONMENT)
-        logger.info("  - API Host: %s", settings.API_HOST)
-        logger.info("  - API Port: %s", settings.API_PORT)
-        logger.info("  - DATABASE_URL set: %s", bool(settings.DATABASE_URL))
-        logger.info("  - Embedding Backend: %s", settings.EMBEDDING_BACKEND)
-        logger.info("  - Default LLM: %s/%s", settings.DEFAULT_LLM_PROVIDER, settings.DEFAULT_LLM_MODEL)
+        _init_confidence_calibration()
 
-        logger.info("=" * 80)
-        logger.info("API READY - Listening for requests")
-        logger.info("=" * 80)
+        logger.info("Environment: %s", settings.ENVIRONMENT)
+        logger.info("API Host: %s", settings.API_HOST)
+        logger.info("API Port: %s", settings.API_PORT)
+        logger.info("DATABASE_URL set: %s", bool(settings.DATABASE_URL))
+        logger.info("Embedding Backend: %s", settings.EMBEDDING_BACKEND)
+        logger.info("Default LLM: %s/%s", settings.DEFAULT_LLM_PROVIDER, settings.DEFAULT_LLM_MODEL)
 
         yield
     except Exception as e:
         logger.error("Startup failed: %s", e, exc_info=True)
         raise
     finally:
-        logger.info("=" * 80)
-        logger.info("SHUTTING DOWN API")
-        logger.info("=" * 80)
         try:
-            logger.info("Closing database connections...")
             close_database_connections()
-            logger.info("[ok] Database connections closed")
         except Exception as e:
             logger.error("Shutdown error: %s", e, exc_info=True)
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-# App
-# ───────────────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title=settings.APP_NAME,
     description="Advanced political speech analysis",
@@ -129,24 +112,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# If you are behind a proxy (Render/Railway), this preserves client IP info.
-# Only enable in production to reduce surprises during local dev.
 if settings.ENVIRONMENT.lower() in ("production", "prod") and ProxyHeadersMiddleware is not None:
     app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
-# Optional: restrict Host header (set your domains if enabling it)
-# if settings.ENVIRONMENT.lower() in ("production", "prod"):
-#     app.add_middleware(TrustedHostMiddleware, allowed_hosts=[
-#         "your-domain.com", "*.onrender.com", "*.railway.app", "*.vercel.app", "localhost"
-#     ])
-
-# Public static/media mount (remove if you don't need to expose /media)
+os.makedirs("media", exist_ok=True)
+os.makedirs("media/uploads", exist_ok=True)
 app.mount("/media", StaticFiles(directory="media"), name="media")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins_list,  # CSV or JSON array from env
+    allow_origins=settings.cors_origins_list,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"],
     allow_headers=["*"],
@@ -154,32 +129,18 @@ app.add_middleware(
     max_age=86400,
 )
 
-# gzip
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Request logging middleware
-# ───────────────────────────────────────────────────────────────────────────────
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start_time = datetime.utcnow()
     response = await call_next(request)
     duration = (datetime.utcnow() - start_time).total_seconds()
-
-    logger.info(
-        "%s %s - Status: %s - Duration: %.3fs",
-        request.method,
-        request.url.path,
-        response.status_code,
-        duration,
-    )
+    logger.info("%s %s - Status: %s - Duration: %.3fs", request.method, request.url.path, response.status_code, duration)
     return response
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Exception handlers
-# ───────────────────────────────────────────────────────────────────────────────
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     logger.warning("HTTP %s: %s", exc.status_code, exc.detail)
@@ -222,21 +183,12 @@ async def general_exception_handler(request: Request, exc: Exception):
     )
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Routers (mounted under /api to keep endpoints consistent)
-# ───────────────────────────────────────────────────────────────────────────────
-app.include_router(auth_router,     prefix="/api")
-app.include_router(users_router,    prefix="/api")
+app.include_router(auth_router, prefix="/api")
+app.include_router(users_router, prefix="/api")
 app.include_router(speeches_router, prefix="/api")
 app.include_router(analysis_router, prefix="/api")
 
-logger.info("Routes registered: /api/auth, /api/users, /api/speeches, /api/analysis")
 
-
-
-# ───────────────────────────────────────────────────────────────────────────────
-# Basic endpoints
-# ───────────────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
     return {
@@ -260,7 +212,6 @@ async def health_check():
     try:
         db_health = check_database_health()
         overall_status = "healthy" if db_health.get("status") == "healthy" else "degraded"
-
         return {
             "status": overall_status,
             "api": {"status": "operational", "version": settings.APP_VERSION},
@@ -271,21 +222,16 @@ async def health_check():
         logger.error("Health check failed: %s", e, exc_info=True)
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={
-                "status": "unhealthy",
-                "error": str(e),
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-            },
+            content={"status": "unhealthy", "error": str(e), "timestamp": datetime.utcnow().isoformat() + "Z"},
         )
 
 
 @app.get("/info")
 async def system_info():
     try:
-        from app.database import get_database_stats
+        from app.database.connection import get_database_stats
 
         stats = get_database_stats()
-
         return {
             "success": True,
             "data": {
@@ -304,14 +250,9 @@ async def system_info():
         }
     except Exception as e:
         logger.error("Info endpoint failed: %s", e, exc_info=True)
-        return {
-            "success": False,
-            "error": str(e),
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-        }
+        return {"success": False, "error": str(e), "timestamp": datetime.utcnow().isoformat() + "Z"}
 
 
-# Local dev entrypoint
 if __name__ == "__main__":
     import uvicorn
 

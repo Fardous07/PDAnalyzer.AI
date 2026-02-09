@@ -1,15 +1,7 @@
-
 // frontend/src/services/api.js
 import axios from "axios";
 
-// Backend base URL (no trailing slash)
 export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://localhost:8000").replace(/\/+$/, "");
-
-console.log("API Base URL:", API_BASE_URL);
-
-// -------------------------------------------------------
-// Time Utility Functions
-// -------------------------------------------------------
 
 export function formatTime(seconds) {
   if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return "00:00";
@@ -17,14 +9,6 @@ export function formatTime(seconds) {
   const mins = Math.floor(s / 60);
   const secs = Math.floor(s % 60);
   return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
-}
-
-export function jumpToTime(seconds) {
-  const videoPlayer = document.getElementById("video-player");
-  if (videoPlayer) {
-    videoPlayer.currentTime = Number(seconds) || 0;
-    videoPlayer.play?.();
-  }
 }
 
 export function formatTimeWithHours(seconds) {
@@ -41,36 +25,85 @@ export function formatTimeRange(startTime, endTime) {
   return `${formatTime(startTime)} - ${formatTime(endTime)}`;
 }
 
-// -------------------------------------------------------
-// Auth token helpers
-// -------------------------------------------------------
+export function jumpToTime(seconds) {
+  const videoPlayer = document.getElementById("video-player");
+  if (videoPlayer) {
+    videoPlayer.currentTime = Number(seconds) || 0;
+    videoPlayer.play?.();
+  }
+}
 
 const TOKEN_KEY = "token";
 const REFRESH_KEY = "refresh_token";
 const USER_KEY = "user";
 
+function stripBearer(t) {
+  return typeof t === "string" ? t.replace(/^Bearer\s+/i, "").trim() : null;
+}
+
+function base64UrlToJson(b64url) {
+  try {
+    let b64 = String(b64url).replace(/-/g, "+").replace(/_/g, "/");
+    while (b64.length % 4) b64 += "=";
+    const binary = atob(b64);
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    const text = new TextDecoder().decode(bytes);
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function decodeJwtPayload(token) {
+  const raw = stripBearer(token);
+  if (!raw) return null;
+  const parts = raw.split(".");
+  if (parts.length < 2) return null;
+  return base64UrlToJson(parts[1]);
+}
+
+function jwtType(token) {
+  const p = decodeJwtPayload(token);
+  return p?.type || p?.typ || p?.token_type || p?.tokenType || null;
+}
+
 export function getAccessToken() {
-  const t = localStorage.getItem(TOKEN_KEY);
+  const t = stripBearer(localStorage.getItem(TOKEN_KEY));
   if (!t || t === "undefined" || t === "null") return null;
+  if (jwtType(t) === "refresh") return null;
   return t;
 }
 
 export function getRefreshToken() {
-  const t = localStorage.getItem(REFRESH_KEY);
+  const t = stripBearer(localStorage.getItem(REFRESH_KEY));
   if (!t || t === "undefined" || t === "null") return null;
   return t;
 }
 
 export function setAuthTokens({ accessToken, refreshToken, user } = {}) {
-  if (accessToken) localStorage.setItem(TOKEN_KEY, accessToken);
-  if (refreshToken) localStorage.setItem(REFRESH_KEY, refreshToken);
+  let a = stripBearer(accessToken);
+  let r = stripBearer(refreshToken);
+
+  const aType = a ? jwtType(a) : null;
+  const rType = r ? jwtType(r) : null;
+  if (a && r && aType === "refresh" && rType === "access") {
+    const tmp = a;
+    a = r;
+    r = tmp;
+  }
+
+  if (a && jwtType(a) === "refresh") {
+    r = r || a;
+    a = null;
+  }
+
+  if (a) localStorage.setItem(TOKEN_KEY, a);
+  if (r) localStorage.setItem(REFRESH_KEY, r);
 
   if (user !== undefined) {
     try {
       localStorage.setItem(USER_KEY, JSON.stringify(user));
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 }
 
@@ -80,26 +113,104 @@ export function clearAuthTokens() {
   localStorage.removeItem(USER_KEY);
 }
 
-// -------------------------------------------------------
-// Axios clients
-// -------------------------------------------------------
+function extractBackendMessage(responseData) {
+  if (!responseData) return null;
 
-const apiClient = axios.create({
-  baseURL: API_BASE_URL,
-  timeout: 60000,
-  withCredentials: false,
-});
+  if (typeof responseData === "string") {
+    const s = responseData.trim();
+    return s ? s : null;
+  }
 
-const uploadClient = axios.create({
-  baseURL: API_BASE_URL,
-  timeout: 300000,
-  withCredentials: false,
-});
+  if (typeof responseData === "object") {
+    if (typeof responseData.detail === "string" && responseData.detail.trim()) return responseData.detail.trim();
+    if (typeof responseData.message === "string" && responseData.message.trim()) return responseData.message.trim();
+    if (typeof responseData.error === "string" && responseData.error.trim()) return responseData.error.trim();
 
-// Attach auth token to requests
+    if (responseData.error && typeof responseData.error === "object") {
+      if (typeof responseData.error.message === "string" && responseData.error.message.trim()) return responseData.error.message.trim();
+      if (typeof responseData.error.code === "string" && responseData.error.code.trim()) return responseData.error.code.trim();
+      if (typeof responseData.error.type === "string" && responseData.error.type.trim()) return responseData.error.type.trim();
+    }
+
+    if (responseData.data && typeof responseData.data === "object") {
+      const nested = extractBackendMessage(responseData.data);
+      if (nested) return nested;
+    }
+
+    if (responseData.result && typeof responseData.result === "object") {
+      const nested = extractBackendMessage(responseData.result);
+      if (nested) return nested;
+    }
+
+    try {
+      return JSON.stringify(responseData);
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+function looksLikeQuotaOrBillingIssue(msg) {
+  const s = String(msg || "").toLowerCase();
+  return s.includes("insufficient_quota") || s.includes("exceeded your current quota") || s.includes("check your plan and billing") || s.includes("billing") || s.includes("quota");
+}
+
+function looksLikeRateLimit(msg) {
+  const s = String(msg || "").toLowerCase();
+  return s.includes("rate limit") || s.includes("too many requests");
+}
+
+const apiClient = axios.create({ baseURL: API_BASE_URL, timeout: 60000, withCredentials: false });
+const uploadClient = axios.create({ baseURL: API_BASE_URL, timeout: 300000, withCredentials: false });
+
+let _refreshPromise = null;
+
+function unwrapResponse(input) {
+  if (input && typeof input === "object" && "status" in input && "data" in input) {
+    return unwrapResponse(input.data);
+  }
+
+  if (input && typeof input === "object" && "success" in input) {
+    if (input.success === false) {
+      throw new Error(input.error || input.message || input.detail || "Request failed");
+    }
+    if ("data" in input) return input.data;
+    return input;
+  }
+
+  return input;
+}
+
+async function refreshAccessToken() {
+  if (_refreshPromise) return _refreshPromise;
+
+  const refresh_token = getRefreshToken();
+  if (!refresh_token) throw new Error("Missing refresh token");
+
+  _refreshPromise = apiClient
+    .post("/api/auth/refresh", { refresh_token }, { _skipAuth: true })
+    .then((res) => unwrapResponse(res.data))
+    .then((data) => {
+      const access = data?.access_token || data?.tokens?.access_token;
+      const refresh = data?.refresh_token || data?.tokens?.refresh_token || refresh_token;
+      if (!access) throw new Error("Refresh did not return access_token");
+      setAuthTokens({ accessToken: access, refreshToken: refresh });
+      return access;
+    })
+    .finally(() => {
+      _refreshPromise = null;
+    });
+
+  return _refreshPromise;
+}
+
 [apiClient, uploadClient].forEach((client) => {
   client.interceptors.request.use(
     (config) => {
+      if (config?._skipAuth) return config;
+
       const token = getAccessToken();
       if (token) {
         config.headers = config.headers || {};
@@ -112,180 +223,72 @@ const uploadClient = axios.create({
 
   client.interceptors.response.use(
     (response) => response,
-    (error) => {
-      console.error("API Error:", {
-        message: error.message,
-        status: error.response?.status,
-        data: error.response?.data,
-        url: error.config?.url,
-      });
+    async (error) => {
+      const status = error?.response?.status;
+      const original = error?.config;
+
+      const url = String(original?.url || "");
+      const isAuthCall = url.includes("/api/auth/login") || url.includes("/api/auth/refresh");
+
+      if (status === 401 && original && !original._retry && !isAuthCall) {
+        original._retry = true;
+        try {
+          const newAccess = await refreshAccessToken();
+          original.headers = original.headers || {};
+          original.headers.Authorization = `Bearer ${newAccess}`;
+          return client.request(original);
+        } catch {
+          clearAuthTokens();
+        }
+      }
+
       return Promise.reject(error);
     }
   );
 });
 
-// -------------------------------------------------------
-// Response unwrap helpers
-// -------------------------------------------------------
-
-function unwrapResponse(data) {
-  // Common backend shape: { success, data, error, message, timestamp }
-  if (data && typeof data === "object" && "success" in data) {
-    if (data.success === false) {
-      const msg = data.error || data.message || data.detail || "Request failed";
-      throw new Error(msg);
-    }
-    if ("data" in data) return data.data;
-    return data;
-  }
-  return data;
-}
-
-function safeArray(v) {
-  return Array.isArray(v) ? v : [];
-}
-
-// -------------------------------------------------------
-// Ideology normalization (Centrist-only; NO Neutral)
-// -------------------------------------------------------
-
-const LIB = "Libertarian";
-const AUTH = "Authoritarian";
-const CENTRIST = "Centrist";
-
-function normalizeScores(scores) {
-  const s = scores && typeof scores === "object" ? scores : {};
-  const lib = Number(s.Libertarian ?? 0);
-  const auth = Number(s.Authoritarian ?? 0);
-
-  // Centrist must be provided by backend; otherwise compute complement.
-  let cen = Number(s.Centrist ?? 0);
-  if (!Number.isFinite(cen) || (cen === 0 && !("Centrist" in s))) {
-    const comp = 100 - lib - auth;
-    cen = Number.isFinite(comp) ? Math.max(0, comp) : 0;
-  }
-
-  return {
-    Libertarian: Number.isFinite(lib) ? lib : 0,
-    Authoritarian: Number.isFinite(auth) ? auth : 0,
-    Centrist: Number.isFinite(cen) ? cen : 0,
-  };
-}
-
-// Deep sanitizer to remove legacy "Neutral", normalize family/subtype recursively
-function purgeLegacyNeutralEverywhere(obj) {
-  if (Array.isArray(obj)) return obj.map(purgeLegacyNeutralEverywhere);
-
-  if (obj && typeof obj === "object") {
-    const out = {};
-    for (const [k, v] of Object.entries(obj)) {
-      out[k] = purgeLegacyNeutralEverywhere(v);
-    }
-
-    // Sanitize any 'scores' dict
-    if (out.scores && typeof out.scores === "object") {
-      const s = { ...out.scores };
-      if ("Neutral" in s && !("Centrist" in s)) s.Centrist = s.Neutral;
-      delete s.Neutral;
-      out.scores = normalizeScores(s);
-    }
-
-    // Normalize common family/subtype fields
-    const famKeys = ["ideology_family", "dominant_family", "family"];
-    const subKeys = ["ideology_subtype", "dominant_subtype", "subtype"];
-
-    const famKey = famKeys.find((fk) => fk in out);
-    if (famKey) {
-      const famIn = String(out[famKey] || "").trim();
-      const fam = famIn === "Neutral" ? CENTRIST : famIn;
-      const normalizedFam = [LIB, AUTH, CENTRIST].includes(fam) ? fam : CENTRIST;
-      out[famKey] = normalizedFam;
-
-      subKeys.forEach((sk) => {
-        if (sk in out) {
-          const sub = String(out[sk] || "").trim();
-          out[sk] = normalizedFam === CENTRIST ? null : (sub || null);
-        }
-      });
-    }
-
-    return out;
-  }
-
-  return obj;
-}
-
-function normalizeIdeologyPayload(payload) {
-  if (!payload || typeof payload !== "object") return payload;
-
-  // Deep sanitize first (covers nested data too)
-  payload = purgeLegacyNeutralEverywhere(payload);
-
-  // Idempotent: ensure top-level normalization
-  if (payload.scores && typeof payload.scores === "object") {
-    payload.scores = normalizeScores(payload.scores);
-  }
-
-  if (payload.speech_level && typeof payload.speech_level === "object") {
-    if (payload.speech_level.scores && typeof payload.speech_level.scores === "object") {
-      payload.speech_level.scores = normalizeScores(payload.speech_level.scores);
-    }
-    if (payload.speech_level.dominant_family === CENTRIST) payload.speech_level.dominant_subtype = null;
-  }
-
-  if (payload.ideology_family === CENTRIST) payload.ideology_subtype = null;
-
-  return payload;
-}
-
-// -------------------------------------------------------
-// Centralized error handler
-// -------------------------------------------------------
+export { apiClient, uploadClient };
 
 function handleAxiosError(error, { logoutOn401 = true } = {}) {
-  console.error("Axios error details:", {
-    code: error.code,
-    message: error.message,
-    response: error.response?.data,
-    status: error.response?.status,
-  });
-
   const status = error?.response?.status;
   const responseData = error?.response?.data;
 
-  let backendDetail = null;
-  if (responseData) {
-    if (typeof responseData === "object") {
-      backendDetail = responseData.detail || responseData.error || responseData.message;
-    } else if (typeof responseData === "string") {
-      backendDetail = responseData;
-    }
+  const backendMsg = extractBackendMessage(responseData);
+  let message = (backendMsg && backendMsg.trim ? backendMsg.trim() : null) || error?.message || "Request failed. Please try again.";
+
+  if (looksLikeQuotaOrBillingIssue(message)) {
+    message = "AI provider quota exceeded. Check billing/quota and try again.";
+  } else if (looksLikeRateLimit(message)) {
+    message = "AI provider rate limited. Try again in a moment.";
   }
 
-  let message =
-    (typeof backendDetail === "string" && backendDetail.trim() ? backendDetail : null) ||
-    error?.message ||
-    "Request failed. Please try again.";
-
-  const hasBackendMessage = typeof backendDetail === "string" && backendDetail.trim();
+  const hasBackendMessage = Boolean(backendMsg && typeof backendMsg === "string" && backendMsg.trim());
 
   if (status === 401 && logoutOn401) {
-    clearAuthTokens();
+    if (!getRefreshToken()) clearAuthTokens();
     if (!hasBackendMessage) message = "Session expired. Please log in again.";
-  } else if (status === 403) {
-    if (!hasBackendMessage) message = "You do not have permission to access this resource.";
-  } else if (status === 404) {
-    if (!hasBackendMessage) message = "Resource not found.";
-  } else if (status === 413) {
-    if (!hasBackendMessage) message = "File too large. Please try a smaller file.";
-  } else if (status === 429) {
-    if (!hasBackendMessage) message = "Too many requests. Please try again later.";
-  } else if (status >= 500) {
-    if (!hasBackendMessage) message = "Server error. Please try again later.";
+  } else if (status === 402 && !hasBackendMessage) {
+    message = "Payment/quota required for the AI provider. Check billing/quota and try again.";
+  } else if (status === 403 && !hasBackendMessage) {
+    message = "You do not have permission to access this resource.";
+  } else if (status === 404 && !hasBackendMessage) {
+    message = "Resource not found.";
+  } else if (status === 413 && !hasBackendMessage) {
+    message = "File too large. Please try a smaller file.";
+  } else if (status === 429 && !hasBackendMessage) {
+    message = "Too many requests. Please try again later.";
+  } else if (status >= 500 && !hasBackendMessage) {
+    message = "Server error. Please try again later.";
   }
 
-  // Browser CORS/network failures show up as "Network Error"
-  if (error.message?.includes("Network Error") || error.code === "ERR_NETWORK") {
+  if (status === 422 && responseData && typeof responseData === "object" && Array.isArray(responseData.detail)) {
+    const first = responseData.detail[0] || null;
+    const loc = Array.isArray(first?.loc) ? first.loc.join(".") : "";
+    const msg = first?.msg || "";
+    message = `Validation error${loc ? ` (${loc})` : ""}${msg ? `: ${msg}` : ""}`;
+  }
+
+  if (error?.message?.includes("Network Error") || error?.code === "ERR_NETWORK") {
     message = "Cannot connect to the server. Please check if the backend is running.";
   }
 
@@ -296,30 +299,21 @@ function handleAxiosError(error, { logoutOn401 = true } = {}) {
   throw new Error(message);
 }
 
-// -------------------------------------------------------
-// Health Check
-// -------------------------------------------------------
-
 export async function checkBackendConnection() {
   try {
     const res = await fetch(`${API_BASE_URL}/health`);
     return res.ok ? { ok: true, status: res.status, data: await res.json() } : { ok: false, status: res.status };
   } catch (error) {
-    return { ok: false, error: error.message };
+    return { ok: false, error: error?.message || String(error) };
   }
 }
-
-// -------------------------------------------------------
-// Authentication API
-// -------------------------------------------------------
 
 export const authAPI = {
   login: async (credentials) => {
     try {
-      const res = await apiClient.post("/api/auth/login", credentials);
+      const res = await apiClient.post("/api/auth/login", credentials, { _skipAuth: true });
       const data = res.data;
 
-      // preferred shape: { success, tokens, user }
       if (data?.success && data?.tokens && data?.user) {
         const out = {
           access_token: data.tokens.access_token,
@@ -332,32 +326,19 @@ export const authAPI = {
         return out;
       }
 
-      // fallback shapes
       if (data?.access_token && data?.user) {
         setAuthTokens({ accessToken: data.access_token, refreshToken: data.refresh_token, user: data.user });
         return data;
       }
 
-      if (data?.data) {
-        if (data.data.tokens && data.data.user) {
-          const out = {
-            access_token: data.data.tokens.access_token,
-            refresh_token: data.data.tokens.refresh_token,
-            user: data.data.user,
-            token_type: data.data.tokens.token_type || "bearer",
-            expires_in: data.data.tokens.expires_in,
-          };
-          setAuthTokens({ accessToken: out.access_token, refreshToken: out.refresh_token, user: out.user });
-          return out;
-        }
-        if (data.data.access_token && data.data.user) {
-          setAuthTokens({
-            accessToken: data.data.access_token,
-            refreshToken: data.data.refresh_token,
-            user: data.data.user,
-          });
-          return data.data;
-        }
+      if (data?.data?.tokens && data?.data?.user) {
+        const out = {
+          access_token: data.data.tokens.access_token,
+          refresh_token: data.data.tokens.refresh_token,
+          user: data.data.user,
+        };
+        setAuthTokens({ accessToken: out.access_token, refreshToken: out.refresh_token, user: out.user });
+        return out;
       }
 
       throw new Error("Invalid login response format");
@@ -366,28 +347,12 @@ export const authAPI = {
     }
   },
 
-  // ✅ IMPORTANT: DO NOT AUTO-LOGIN ON REGISTER
   register: async (userData) => {
     try {
-      const res = await apiClient.post("/api/auth/register", userData);
+      const res = await apiClient.post("/api/auth/register", userData, { _skipAuth: true });
       const data = res.data;
-
-      // backend likely returns { success, user, tokens } but we do NOT store tokens here
-      if (data?.success) {
-        return {
-          success: true,
-          message: data?.message || "Registration successful. Please sign in.",
-        };
-      }
-
-      // wrapped response fallback
-      if (data?.data?.success) {
-        return {
-          success: true,
-          message: data?.data?.message || "Registration successful. Please sign in.",
-        };
-      }
-
+      if (data?.success) return { success: true, message: data?.message || "Registration successful. Please sign in." };
+      if (data?.data?.success) return { success: true, message: data?.data?.message || "Registration successful. Please sign in." };
       throw new Error(data?.error || data?.message || "Registration failed");
     } catch (error) {
       handleAxiosError(error, { logoutOn401: false });
@@ -419,7 +384,7 @@ export const authAPI = {
       const refresh_token = getRefreshToken();
       if (!refresh_token) throw new Error("Missing refresh token. Please log in again.");
 
-      const res = await apiClient.post("/api/auth/refresh", { refresh_token });
+      const res = await apiClient.post("/api/auth/refresh", { refresh_token }, { _skipAuth: true });
       const data = unwrapResponse(res.data);
 
       const access = data?.access_token || data?.tokens?.access_token;
@@ -427,7 +392,7 @@ export const authAPI = {
 
       if (!access) throw new Error("Invalid refresh response: missing access token.");
 
-      setAuthTokens({ accessToken: access, RefreshToken: refresh || refresh_token });
+      setAuthTokens({ accessToken: access, refreshToken: refresh || refresh_token });
       return data;
     } catch (error) {
       handleAxiosError(error, { logoutOn401: true });
@@ -435,30 +400,184 @@ export const authAPI = {
   },
 };
 
-// -------------------------------------------------------
-// Speech APIs (use trailing slash to avoid 307)
-// -------------------------------------------------------
+const MAX_PAGE_SIZE = 100;
+
+function clampInt(v, fallback) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.floor(n);
+}
+
+function normalizeListParams(params = {}) {
+  const p = { ...(params || {}) };
+
+  if (p.page_size != null) p.page_size = Math.min(MAX_PAGE_SIZE, Math.max(1, clampInt(p.page_size, MAX_PAGE_SIZE)));
+  if (p.limit != null) p.limit = Math.min(MAX_PAGE_SIZE, Math.max(1, clampInt(p.limit, MAX_PAGE_SIZE)));
+
+  if (p.page != null) p.page = Math.max(1, clampInt(p.page, 1));
+
+  return p;
+}
+
+function extractSpeechArray(payload) {
+  if (!payload) return [];
+  if (Array.isArray(payload)) return payload;
+
+  if (typeof payload === "object") {
+    const cands = [
+      payload.speeches,
+      payload.items,
+      payload.results,
+      payload.data?.speeches,
+      payload.data?.items,
+      payload.data?.results,
+    ];
+    for (const c of cands) {
+      if (Array.isArray(c)) return c;
+    }
+  }
+  return [];
+}
 
 export async function listSpeeches(params = {}) {
-  try {
-    // IMPORTANT: backend route is "/api/speeches/" (router has @router.get("/"))
-    const res = await apiClient.get("/api/speeches/", { params });
+  const fetchWith = async (p) => {
+    const res = await apiClient.get("/api/speeches/", { params: normalizeListParams(p) });
     const payload = unwrapResponse(res.data);
+    return extractSpeechArray(payload);
+  };
 
-    if (payload && typeof payload === "object") {
-      if (Array.isArray(payload.speeches)) return payload.speeches;
-      if (Array.isArray(payload.data?.speeches)) return payload.data.speeches;
+  try {
+    return await fetchWith(params);
+  } catch (error) {
+    if (error?.response?.status === 422) {
+      try {
+        return await fetchWith({});
+      } catch (e2) {
+        handleAxiosError(e2);
+      }
     }
-    if (Array.isArray(payload)) return payload;
-    return [];
+    handleAxiosError(error);
+  }
+}
+
+export async function listSpeechesAll({ pageSize = 100, max = 10000 } = {}) {
+  const size = Math.min(100, Math.max(1, clampInt(pageSize, 100)));
+  const out = [];
+  const seen = new Set();
+
+  let page = 1;
+  let guard = 0;
+
+  while (out.length < max && guard < 200) {
+    guard += 1;
+
+    let batch = [];
+    try {
+      batch = await listSpeeches({ page, page_size: size });
+    } catch {
+      batch = [];
+    }
+
+    if (!Array.isArray(batch) || batch.length === 0) break;
+
+    let added = 0;
+    for (const s of batch) {
+      const k = String(s?.id ?? s?.speech_id ?? s?.speechId ?? s?._id ?? "").trim();
+      if (!k || seen.has(k)) continue;
+      seen.add(k);
+      out.push(s);
+      added += 1;
+      if (out.length >= max) break;
+    }
+
+    if (added === 0) break;
+    if (batch.length < size) break;
+
+    page += 1;
+  }
+
+  return out;
+}
+
+export async function getSpeechesStats() {
+  try {
+    const res = await apiClient.get("/api/speeches/stats");
+    return unwrapResponse(res.data);
   } catch (error) {
     handleAxiosError(error);
   }
 }
 
-export async function getSpeech(speechId, params = {}) {
+export async function searchSpeeches({ q, search_in = "all", include_public = false, limit = 20 } = {}) {
+  const qq = String(q ?? "").trim();
+  if (qq.length < 2) return [];
+
+  const safeLimit = Math.min(100, Math.max(1, clampInt(limit, 20)));
+
   try {
-    const res = await apiClient.get(`/api/speeches/${speechId}`, { params });
+    const res = await apiClient.get("/api/speeches/search", {
+      params: { q: qq, search_in, include_public, limit: safeLimit },
+    });
+    const payload = unwrapResponse(res.data);
+    return extractSpeechArray(payload);
+  } catch (error) {
+    handleAxiosError(error);
+  }
+}
+
+export async function createSpeech(payload) {
+  try {
+    const res = await apiClient.post("/api/speeches/", payload);
+    return unwrapResponse(res.data);
+  } catch (error) {
+    handleAxiosError(error);
+  }
+}
+
+export async function uploadSpeech({
+  file,
+  title,
+  speaker,
+  topic,
+  date,
+  date_str,
+  location,
+  event,
+  language = "en",
+  is_public = false,
+  llm_provider = "openai",
+  llm_model = "gpt-4o-mini",
+} = {}) {
+  try {
+    if (!file) throw new Error("Missing file");
+    if (!title) throw new Error("Missing title");
+    if (!speaker) throw new Error("Missing speaker");
+
+    const form = new FormData();
+    form.append("file", file);
+    form.append("title", title);
+    form.append("speaker", speaker);
+    if (topic) form.append("topic", topic);
+    if (date_str || date) form.append("date_str", date_str || date);
+    if (location) form.append("location", location);
+    if (event) form.append("event", event);
+    if (language) form.append("language", language);
+    form.append("is_public", String(Boolean(is_public)));
+    if (llm_provider) form.append("llm_provider", llm_provider);
+    if (llm_model) form.append("llm_model", llm_model);
+
+    const res = await uploadClient.post("/api/speeches/upload", form);
+    return unwrapResponse(res.data);
+  } catch (error) {
+    handleAxiosError(error);
+  }
+}
+
+export async function getSpeech(speechId, { include_text = true, include_analysis = true } = {}) {
+  try {
+    const res = await apiClient.get(`/api/speeches/${encodeURIComponent(String(speechId))}`, {
+      params: { include_text, include_analysis },
+    });
     return unwrapResponse(res.data);
   } catch (error) {
     handleAxiosError(error);
@@ -467,7 +586,7 @@ export async function getSpeech(speechId, params = {}) {
 
 export async function getSpeechFull(speechId) {
   try {
-    const res = await apiClient.get(`/api/speeches/${speechId}/full`);
+    const res = await apiClient.get(`/api/speeches/${encodeURIComponent(String(speechId))}/full`);
     return unwrapResponse(res.data);
   } catch (error) {
     handleAxiosError(error);
@@ -476,92 +595,206 @@ export async function getSpeechFull(speechId) {
 
 export async function getSpeechStatus(speechId) {
   try {
-    const res = await apiClient.get(`/api/speeches/${speechId}/status`);
+    const res = await apiClient.get(`/api/speeches/${encodeURIComponent(String(speechId))}/status`);
     return unwrapResponse(res.data);
   } catch (error) {
     handleAxiosError(error);
   }
 }
 
-// -------------------------------------------------------
-// Analysis APIs
-// -------------------------------------------------------
-
-export async function getAnalysis(speechId, { mediaDurationSeconds } = {}) {
+export async function getSpeechMedia(speechId) {
   try {
-    const params = {};
-    if (Number.isFinite(mediaDurationSeconds) && Number(mediaDurationSeconds) > 0) {
-      params.media_duration_seconds = Number(mediaDurationSeconds);
+    const res = await apiClient.get(`/api/speeches/${encodeURIComponent(String(speechId))}/media`);
+    return unwrapResponse(res.data);
+  } catch (error) {
+    handleAxiosError(error);
+  }
+}
+
+export function getMediaUrl(speechId, speech) {
+  const raw = speech?.media_url ?? speech?.mediaUrl ?? "";
+  if (!raw) return null;
+
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (raw.startsWith("/")) return `${API_BASE_URL}${raw}`;
+
+  return `${API_BASE_URL}/api/speeches/${encodeURIComponent(String(speechId))}/media`;
+}
+
+export async function getAnalysis(speechId, { media_duration_seconds } = {}) {
+  const id = encodeURIComponent(String(speechId));
+
+  const candidates = [
+    { url: `/api/speeches/${id}/analysis`, params: media_duration_seconds != null ? { media_duration_seconds } : undefined },
+    { url: `/api/speeches/${id}/analysis_summary` },
+    { url: `/api/speeches/${id}/analysis-summary` },
+    { url: `/api/analysis/${id}` },
+    { url: `/api/analysis`, params: { speech_id: id } },
+  ];
+
+  let lastErr = null;
+
+  for (const c of candidates) {
+    try {
+      const res = await apiClient.get(c.url, c.params ? { params: c.params } : undefined);
+      return unwrapResponse(res.data);
+    } catch (err) {
+      lastErr = err;
+      const status = err?.response?.status;
+      if (status && status !== 404 && status !== 405) {
+        handleAxiosError(err);
+      }
     }
-    const res = await apiClient.get(`/api/analysis/speech/${speechId}`, { params });
-    const data = unwrapResponse(res.data);
-    return normalizeIdeologyPayload(data);
-  } catch (error) {
-    handleAxiosError(error);
   }
+
+  if (lastErr) handleAxiosError(lastErr);
+  throw new Error("Failed to load analysis.");
 }
 
-export async function reanalyzeSpeechAnalysis(
-  speechId,
-  {
-    useSemantic = true,
-    threshold = 0.6,
-    includeQuestions = true,
-    questionTypes = ["journalistic", "technical"],
-    maxQuestions = 6,
-    mediaDurationSeconds = null,
-    llmProvider = null,
-    llmModel = null,
-  } = {}
-) {
-  try {
-    const body = {
-      use_semantic: Boolean(useSemantic),
-      threshold: Number(threshold),
-      include_questions: Boolean(includeQuestions),
-      question_types: Array.isArray(questionTypes) ? questionTypes : ["journalistic", "technical"],
-      max_questions: Math.max(1, Math.min(8, Number(maxQuestions) || 6)),
-      media_duration_seconds:
-        Number.isFinite(mediaDurationSeconds) && Number(mediaDurationSeconds) > 0
-          ? Number(mediaDurationSeconds)
-          : null,
-      llm_provider: llmProvider || null,
-      llm_model: llmModel || null,
-    };
-
-    const res = await apiClient.post(`/api/analysis/speech/${speechId}/reanalyze`, body);
-    const data = unwrapResponse(res.data);
-    return normalizeIdeologyPayload(data);
-  } catch (error) {
-    handleAxiosError(error);
-  }
+export async function getAnalysisLegacy(speechId) {
+  return getAnalysis(speechId);
 }
 
-export async function generateQuestions({
-  speechId,
-  questionType = "journalistic",
-  maxQuestions = 5,
-  llmProvider = null,
-  llmModel = null,
-} = {}) {
+export async function getKeyStatements(speechId, { media_duration_seconds } = {}) {
   try {
-    const body = {
-      speech_id: Number(speechId),
-      question_type: String(questionType || "journalistic"),
-      max_questions: Math.max(1, Math.min(8, Number(maxQuestions) || 5)),
-      llm_provider: llmProvider || null,
-      llm_model: llmModel || null,
-    };
-    const res = await apiClient.post(`/api/analysis/questions/generate`, body);
+    const res = await apiClient.get(`/api/speeches/${encodeURIComponent(String(speechId))}/key-statements`, {
+      params: media_duration_seconds != null ? { media_duration_seconds } : undefined,
+    });
     return unwrapResponse(res.data);
   } catch (error) {
     handleAxiosError(error);
   }
 }
 
-// -------------------------------------------------------
-// Upload + Polling
-// -------------------------------------------------------
+export async function getSections(speechId, { media_duration_seconds } = {}) {
+  try {
+    const res = await apiClient.get(`/api/speeches/${encodeURIComponent(String(speechId))}/sections`, {
+      params: media_duration_seconds != null ? { media_duration_seconds } : undefined,
+    });
+    return unwrapResponse(res.data);
+  } catch (error) {
+    handleAxiosError(error);
+  }
+}
+
+export async function analyzeSpeech(speechId, { force = false } = {}) {
+  try {
+    const res = await apiClient.post(`/api/speeches/${encodeURIComponent(String(speechId))}/analyze`, null, {
+      params: { force: Boolean(force) },
+    });
+    return unwrapResponse(res.data);
+  } catch (error) {
+    handleAxiosError(error);
+  }
+}
+
+export async function reanalyzeSpeechAnalysis(speechId, opts = {}) {
+  const id = encodeURIComponent(String(speechId));
+
+  const body = {
+    ...opts,
+    use_semantic: opts.useSemantic ?? opts.use_semantic,
+    include_questions: opts.includeQuestions ?? opts.include_questions,
+    question_types: opts.questionTypes ?? opts.question_types,
+    max_questions: opts.maxQuestions ?? opts.max_questions,
+    media_duration_seconds: opts.mediaDurationSeconds ?? opts.media_duration_seconds ?? (opts.mediaDurationSeconds === null ? null : undefined),
+  };
+
+  const candidates = [
+    { method: "post", url: `/api/speeches/${id}/reanalyze`, data: body },
+    { method: "post", url: `/api/speeches/${id}/analysis/reanalyze`, data: body },
+    { method: "post", url: `/api/speeches/${id}/analyze`, data: body },
+    { method: "post", url: `/api/analysis/${id}/reanalyze`, data: body },
+  ];
+
+  let lastErr = null;
+
+  for (const c of candidates) {
+    try {
+      const res = await apiClient.request({ method: c.method, url: c.url, data: c.data });
+      return unwrapResponse(res.data);
+    } catch (e) {
+      lastErr = e;
+      const st = e?.response?.status;
+      if (st && st !== 404 && st !== 405) handleAxiosError(e);
+    }
+  }
+
+  if (lastErr) handleAxiosError(lastErr);
+  throw new Error("Failed to re-analyze speech.");
+}
+
+export async function deleteSpeech(speechId) {
+  try {
+    const res = await apiClient.delete(`/api/speeches/${encodeURIComponent(String(speechId))}`);
+    return unwrapResponse(res.data);
+  } catch (error) {
+    handleAxiosError(error);
+  }
+}
+
+export async function updateSpeech(speechId, updates) {
+  try {
+    const res = await apiClient.put(`/api/speeches/${encodeURIComponent(String(speechId))}`, updates);
+    return unwrapResponse(res.data);
+  } catch (error) {
+    handleAxiosError(error);
+  }
+}
+
+export async function generateQuestions(arg1, arg2 = {}) {
+  try {
+    let speechId;
+    let question_type;
+    let max_questions;
+    let llm_provider;
+    let llm_model;
+
+    if (arg1 && typeof arg1 === "object") {
+      speechId = arg1.speechId ?? arg1.speech_id;
+      question_type = arg1.questionType ?? arg1.question_type ?? "journalistic";
+      max_questions = arg1.maxQuestions ?? arg1.max_questions ?? 5;
+      llm_provider = arg1.llmProvider ?? arg1.llm_provider;
+      llm_model = arg1.llmModel ?? arg1.llm_model;
+    } else {
+      speechId = arg1;
+      question_type = arg2.question_type ?? arg2.questionType ?? "journalistic";
+      max_questions = arg2.max_questions ?? arg2.maxQuestions ?? 5;
+      llm_provider = arg2.llm_provider ?? arg2.llmProvider;
+      llm_model = arg2.llm_model ?? arg2.llmModel;
+    }
+
+    if (speechId === undefined || speechId === null) throw new Error("Missing speechId");
+
+    const id = encodeURIComponent(String(speechId));
+    const body = { question_type, max_questions, llm_provider, llm_model };
+
+    const res = await apiClient.post(`/api/speeches/${id}/questions/generate`, body);
+    return unwrapResponse(res.data);
+  } catch (error) {
+    handleAxiosError(error);
+  }
+}
+
+const _sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const _normProgressForUI = (p) => {
+  const n = Number(p);
+  if (!Number.isFinite(n)) return null;
+  if (n > 0 && n <= 1) return n * 100;
+  if (n >= 0 && n <= 100) return n;
+  return null;
+};
+
+const _statusLooksDone = (s) => {
+  const v = String(s || "").toLowerCase();
+  return v.includes("done") || v.includes("complete") || v.includes("success") || v === "finished";
+};
+
+const _statusLooksFailed = (s) => {
+  const v = String(s || "").toLowerCase();
+  return v.includes("fail") || v.includes("error");
+};
 
 export async function uploadSpeechWithPolling({
   file,
@@ -571,162 +804,100 @@ export async function uploadSpeechWithPolling({
   date = "",
   location = "",
   event = "",
-  language = "en",
   llmProvider = "openai",
   llmModel = "gpt-4o-mini",
   isPublic = false,
-  onProgress = () => {},
-}) {
-  onProgress("Preparing file upload...", 10);
-
-  const formData = new FormData();
-  formData.append("file", file);
-  formData.append("title", title.trim());
-  formData.append("speaker", speaker.trim());
-  if (topic) formData.append("topic", topic.trim());
-  if (date) formData.append("date_str", date);
-  if (location) formData.append("location", location);
-  if (event) formData.append("event", event);
-  formData.append("language", language);
-  formData.append("llm_provider", llmProvider);
-  formData.append("llm_model", llmModel);
-  formData.append("is_public", isPublic.toString());
-
-  let uploadResponse;
+  onProgress,
+  pollIntervalMs = 2500,
+  timeoutMs = 20 * 60 * 1000,
+} = {}) {
   try {
-    onProgress("Uploading file to server...", 30);
+    if (!file) throw new Error("Missing file");
+    if (!title) throw new Error("Missing title");
+    if (!speaker) throw new Error("Missing speaker");
 
-    const res = await uploadClient.post("/api/speeches/upload", formData, {
-      headers: { "Content-Type": "multipart/form-data" },
+    const form = new FormData();
+    form.append("file", file);
+    form.append("title", title);
+    form.append("speaker", speaker);
+    if (topic) form.append("topic", topic);
+    if (date) form.append("date_str", date);
+    if (location) form.append("location", location);
+    if (event) form.append("event", event);
+    form.append("is_public", String(Boolean(isPublic)));
+    form.append("llm_provider", llmProvider);
+    form.append("llm_model", llmModel);
+
+    onProgress?.("Preparing upload…", 1);
+
+    const res = await uploadClient.post("/api/speeches/upload", form, {
+      onUploadProgress: (evt) => {
+        const total = evt.total || 0;
+        const loaded = evt.loaded || 0;
+        if (total > 0) {
+          const frac = Math.max(0, Math.min(1, loaded / total));
+          onProgress?.("Uploading…", Math.round(frac * 25));
+        } else {
+          onProgress?.("Uploading…", 5);
+        }
+      },
     });
 
-    uploadResponse = res.data;
-    onProgress("File uploaded successfully. Starting analysis...", 70);
-  } catch (error) {
-    if (error?.response?.status === 401) throw new Error("Session expired. Please log in again.");
-    if (error?.response?.status === 413) throw new Error("File too large. Please try a smaller file.");
-    if (error?.code === "ECONNABORTED") throw new Error("Upload timeout. The file may be too large.");
+    const payload = unwrapResponse(res.data) || {};
+    const speechId = payload.speech_id ?? payload.speechId ?? payload.id ?? payload?.speech?.id ?? null;
 
-    let errorMessage = "Upload failed";
-    if (error?.response?.data) {
-      const data = error.response.data;
-      errorMessage = data.detail || data.error || data.message || errorMessage;
-    }
-    throw new Error(errorMessage);
-  }
+    if (!speechId) throw new Error("Upload succeeded but response did not include speechId.");
 
-  const data = uploadResponse;
-  const speechId = data?.speech_id || data?.id || data?.data?.speech_id || data?.data?.id;
+    onProgress?.("Upload complete. Processing…", 30);
 
-  if (!speechId) {
-    console.error("Upload response:", uploadResponse);
-    throw new Error("Upload succeeded but no speech ID returned");
-  }
+    const startPolling = async () => {
+      const start = Date.now();
 
-  onProgress("Analysis started...", 80);
+      while (Date.now() - start < timeoutMs) {
+        try {
+          const st = await getSpeechStatus(speechId);
+          const status = st?.status ?? st?.analysis_status ?? st?.state;
+          const msg = st?.message ?? st?.detail ?? "";
+          const p = _normProgressForUI(st?.progress ?? st?.analysis_progress ?? st?.pct ?? st?.percent);
 
-  async function startPolling({ intervalMs = 5000, maxAttempts = 360 } = {}) {
-    let attempt = 0;
+          if (_statusLooksFailed(status)) throw new Error(msg || "Analysis failed.");
 
-    while (attempt < maxAttempts) {
-      attempt += 1;
+          if (_statusLooksDone(status) || st?.analysis_ready === true) {
+            onProgress?.("Analysis complete!", 100);
+            return true;
+          }
 
-      let statusRes;
-      try {
-        statusRes = await apiClient.get(`/api/speeches/${speechId}/status`);
-      } catch (error) {
-        if (error?.response?.status === 401) throw new Error("Session expired. Please log in again.");
-        if (error?.response?.status === 404) throw new Error("Speech not found.");
-        handleAxiosError(error);
+          onProgress?.(msg || "Processing…", p != null ? Math.max(30, Math.min(95, p)) : 60);
+          await _sleep(pollIntervalMs);
+          continue;
+        } catch (e) {
+          const httpStatus = e?.response?.status;
+          if (httpStatus && httpStatus !== 404 && httpStatus !== 405) throw e;
+        }
+
+        try {
+          const a = await getAnalysis(speechId);
+          if (a && typeof a === "object") {
+            onProgress?.("Analysis complete!", 100);
+            return true;
+          }
+        } catch {}
+
+        onProgress?.("Processing…", 70);
+        await _sleep(pollIntervalMs);
       }
 
-      const statusPayload = unwrapResponse(statusRes?.data);
-      const statusVal = statusPayload?.status;
+      throw new Error("Polling timed out. The server may still be processing.");
+    };
 
-      if (statusVal === "completed") {
-        onProgress("Analysis complete!", 100);
-        return await getSpeech(speechId, { include_text: true, include_analysis: true });
-      }
-
-      if (statusVal === "failed") {
-        onProgress("Analysis failed.", 100);
-        const msg = statusPayload?.error_message || statusPayload?.detail || "Analysis failed";
-        throw new Error(msg);
-      }
-
-      const estimatedProgress = Math.min(99, 80 + (attempt / maxAttempts) * 19);
-      const statusMessages = {
-        pending: "Queued for analysis...",
-        processing: "Analyzing speech...",
-        uploaded: "Starting analysis...",
-      };
-
-      onProgress(statusMessages[statusVal] || "Processing...", estimatedProgress);
-      await new Promise((resolve) => setTimeout(resolve, intervalMs));
-    }
-
-    // fallback
-    try {
-      return await getSpeech(speechId, { include_text: true, include_analysis: true });
-    } catch {
-      throw new Error("Analysis taking longer than expected. Check your dashboard.");
-    }
-  }
-
-  return { speechId, startPolling };
-}
-
-// -------------------------------------------------------
-// Media URL helper
-// -------------------------------------------------------
-
-export function getMediaUrl(_speechId, speechData = null) {
-  const url = speechData?.media_url || speechData?.source_url;
-  if (!url || typeof url !== "string") return null;
-
-  if (url.startsWith("http://") || url.startsWith("https://")) return url;
-  if (url.startsWith("/")) return `${API_BASE_URL}${url}`;
-
-  return `${API_BASE_URL}/media/uploads/${url}`;
-}
-
-// -------------------------------------------------------
-// Update / Delete
-// -------------------------------------------------------
-
-export async function deleteSpeech(speechId) {
-  try {
-    const res = await apiClient.delete(`/api/speeches/${speechId}`);
-    return unwrapResponse(res.data);
+    return { speechId, startPolling };
   } catch (error) {
-    handleAxiosError(error);
+    handleAxiosError(error, { logoutOn401: true });
   }
 }
-
-export async function updateSpeech(speechId, updates) {
-  try {
-    const res = await apiClient.put(`/api/speeches/${speechId}`, updates);
-    return unwrapResponse(res.data);
-  } catch (error) {
-    handleAxiosError(error);
-  }
-}
-
-// -------------------------------------------------------
-// Utils
-// -------------------------------------------------------
 
 export function isAuthenticated() {
   return Boolean(getAccessToken());
-}
-
-export function getUserFromStorage() {
-  try {
-    const userStr = localStorage.getItem(USER_KEY);
-    return userStr ? JSON.parse(userStr) : null;
-  } catch {
-    return null;
-  }
 }
 
 export default apiClient;

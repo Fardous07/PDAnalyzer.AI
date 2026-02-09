@@ -1,374 +1,584 @@
-
-# backend/app/api/routes/analysis.py
-
-"""
-DiscourseAI Backend — Analysis Routes (Aligned with AnalysisPage)
-
-Exposes:
-- GET  /api/analysis/speech/{speech_id}
-    - Optional query param: media_duration_seconds
-- POST /api/analysis/speech
-    - Analyze by speech_id or raw text (creates Speech if needed)
-- POST /api/analysis/speech/{speech_id}/reanalyze
-    - Re-run ingestion and UPSERT Analysis (one analysis row per speech)
-- POST /api/analysis/questions/generate
-- GET  /api/analysis/health
-
-POLICY UPDATE:
-- Neutral is removed from the pipeline outputs.
-- Centrist is the only non-ideological family label.
-- Centrist has no subtype (always None).
-"""
-
+# backend/app/api/routes/speeches.py
 from __future__ import annotations
 
+import ast
+import json
 import logging
+import re
+import shutil
 import time
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import or_, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.api.utils.responses import create_response
-from app.database.connection import get_db
-from app.database.models import Analysis, Speech
+from app.database.connection import SessionLocal, get_db
+from app.database.models import Analysis, Question, Speech, User
 
-# Project optional
+# Auth
 try:
-    from app.database.models import Project  # type: ignore
-    _PROJECT_AVAILABLE = True
+    from app.services.auth_service import get_current_user
+
+    _AUTH_AVAILABLE = True
 except Exception:
-    Project = None  # type: ignore
-    _PROJECT_AVAILABLE = False
+    get_current_user = None
+    _AUTH_AVAILABLE = False
 
-# Ingestion optional
+from app.services.speech_ingestion import ingest_speech
+
+_INGEST_AVAILABLE = True
+
+# Transcription
 try:
-    from app.services.speech_ingestion import ingest_speech  # type: ignore
-    _INGEST_AVAILABLE = True
+    from app.services.transcription import transcribe_media_file
+
+    _TRANSCRIPTION_AVAILABLE = True
 except Exception:
-    ingest_speech = None  # type: ignore
-    _INGEST_AVAILABLE = False
+    transcribe_media_file = None
+    _TRANSCRIPTION_AVAILABLE = False
 
-# Question generator optional
+# Semantic embedder
 try:
-    from app.services.question_generator import question_generator  # type: ignore
+    from sentence_transformers import SentenceTransformer
+
+    _EMBEDDER_AVAILABLE = True
+except Exception:
+    SentenceTransformer = None
+    _EMBEDDER_AVAILABLE = False
+
+# Question generator
+try:
+    from app.services.question_generator import question_generator
+
     _QUESTION_GENERATOR_AVAILABLE = True
 except Exception:
-    question_generator = None  # type: ignore
+    question_generator = None
     _QUESTION_GENERATOR_AVAILABLE = False
 
-
 logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/speeches", tags=["speeches"])
 
-router = APIRouter(prefix="/analysis", tags=["analysis"])
+# =============================================================================
+# CONFIG
+# =============================================================================
+MIN_TEXT_CHARS = 50
+DEFAULT_PAGE_SIZE = 20
+MAX_PAGE_SIZE = 100
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+MEDIA_ROOT = Path("media")
+UPLOAD_DIR = MEDIA_ROOT / "uploads"
+MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
+TEXT_FORMATS = {".txt", ".md"}
+DOCUMENT_FORMATS = {".pdf", ".doc", ".docx"}
+AUDIO_FORMATS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
+VIDEO_FORMATS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv"}
+
+_EMBEDDER_MODEL = "all-MiniLM-L6-v2"
+_global_embedder: Optional[Any] = None
+
+# ✅ IMPORTANT: keep background runs consistent with ingestion intent (recall-friendly)
+DEFAULT_CODE_THRESHOLD = 0.35
+
+# =============================================================================
+# FAMILY CONSTANTS (strict)
+# =============================================================================
 LIB_FAMILY = "Libertarian"
 AUTH_FAMILY = "Authoritarian"
+ECON_LEFT = "Economic-Left"
+ECON_RIGHT = "Economic-Right"
 CENTRIST_FAMILY = "Centrist"
-
-_ALLOWED_FAMILIES = {LIB_FAMILY, AUTH_FAMILY, CENTRIST_FAMILY}
-
-# Legacy inputs you might still have in persisted JSON from older runs:
 LEGACY_NEUTRAL = "Neutral"
 
-
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
-
-class AnalyzeSpeechRequest(BaseModel):
-    speech_id: Optional[int] = Field(default=None, description="Existing speech ID to analyze")
-    text: Optional[str] = Field(default=None, description="Speech text to analyze (creates new speech if no speech_id)")
-
-    title: Optional[str] = None
-    speaker: Optional[str] = None
-
-    project_id: Optional[int] = None
-
-    use_semantic: bool = True
-    threshold: float = 0.6
-
-    include_questions: bool = True
-    question_types: List[str] = Field(default_factory=lambda: ["journalistic", "technical"])
-    llm_provider: Optional[str] = None
-    llm_model: Optional[str] = None
-    max_questions: int = 6
-
-    media_duration_seconds: Optional[float] = Field(
-        default=None,
-        description=(
-            "If provided, backend computes time_begin/time_end for key_statements (and segments) "
-            "using start_char/end_char ratios against transcript length."
-        ),
-    )
+_ALLOWED_FAMILIES = {LIB_FAMILY, AUTH_FAMILY, ECON_LEFT, ECON_RIGHT, CENTRIST_FAMILY}
+_IDEOLOGICAL_FAMILIES = {LIB_FAMILY, AUTH_FAMILY, ECON_LEFT, ECON_RIGHT}
 
 
-class ReanalyzeRequest(BaseModel):
-    use_semantic: bool = True
-    threshold: float = 0.6
-    include_questions: bool = True
-    question_types: List[str] = Field(default_factory=lambda: ["journalistic", "technical"])
-    llm_provider: Optional[str] = None
-    llm_model: Optional[str] = None
-    max_questions: int = 6
-    media_duration_seconds: Optional[float] = None
+def _normalize_family(x: Any) -> str:
+    s = str(x or "").strip()
+    if s == LEGACY_NEUTRAL:
+        return CENTRIST_FAMILY
+    return s if s in _ALLOWED_FAMILIES else CENTRIST_FAMILY
 
 
-class GenerateQuestionsRequest(BaseModel):
-    speech_id: int = Field(..., ge=1)
-    question_type: str = Field(default="journalistic")
-    max_questions: int = Field(default=5, ge=1, le=8)
-    llm_provider: Optional[str] = None
-    llm_model: Optional[str] = None
+def _normalize_subtype(family: str, subtype: Any) -> Optional[str]:
+    fam = _normalize_family(family)
+    if fam not in (LIB_FAMILY, AUTH_FAMILY):
+        return None
+    sub = str(subtype or "").strip()
+    return sub or None
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _now_z() -> str:
+# =============================================================================
+# HELPERS
+# =============================================================================
+def _now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
+
+
+def _response(
+    success: bool,
+    data: Any = None,
+    error: Optional[str] = None,
+    message: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    out = {"success": success, "data": data, "error": error, "message": message, "timestamp": _now_iso()}
+    if meta:
+        out["metadata"] = meta
+    return out
+
+
+def _parse_iso_date(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    v = value.strip()
+    if not v:
+        return None
+    try:
+        if len(v) == 10 and v.count("-") == 2:
+            return datetime.strptime(v, "%Y-%m-%d")
+        return datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use ISO (YYYY-MM-DD or full ISO datetime).")
+
+
+def _word_count(text: str) -> int:
+    return len((text or "").split())
+
+
+def _clean_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.replace("\x00", "")
+    text = re.sub(r"[\x01-\x08\x0B\x0C\x0E-\x1F]", "", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _safe_filename(original: str, *, prefix: str) -> str:
+    original = original or "upload"
+    p = Path(original)
+    ext = p.suffix.lower()
+    base = p.stem
+    base = re.sub(r"\s+", "_", base)
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base)
+    base = base.strip("._-") or "file"
+    base = base[:120]
+    return f"{prefix}_{base}{ext}"
+
+
+def _safe_full_results(x: Any) -> Dict[str, Any]:
+    if x is None:
+        return {}
+    if isinstance(x, dict):
+        return dict(x)
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return {}
+        try:
+            obj = json.loads(s)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            pass
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                obj2 = ast.literal_eval(s)
+                return obj2 if isinstance(obj2, dict) else {}
+            except Exception:
+                return {}
+        return {}
+    try:
+        return dict(x)
+    except Exception:
+        return {}
 
 
 def _as_float(x: Any, default: float = 0.0) -> float:
     try:
-        if x is None:
-            return default
-        return float(x)
+        return float(x) if x is not None else default
     except Exception:
         return default
+
+
+def _as_int(x: Any, default: int = 0) -> int:
+    try:
+        return int(x) if x is not None else default
+    except Exception:
+        return default
+
+
+def _as_dict(x: Any) -> Dict[str, Any]:
+    return x if isinstance(x, dict) else {}
+
+
+def _as_list(x: Any) -> List[Any]:
+    return x if isinstance(x, list) else []
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
-def _normalize_question_types(qtypes: List[str]) -> List[str]:
-    qtypes = [str(t or "").strip().lower() for t in (qtypes or [])]
-    qtypes = [t for t in qtypes if t in ("journalistic", "technical")]
-    return qtypes or ["journalistic", "technical"]
+# =============================================================================
+# 2D IDEOLOGY SANITIZATION
+# =============================================================================
+def _axis_labels_block() -> Dict[str, Any]:
+    return {
+        "x_axis": {"name": "Economic", "negative": "Left", "positive": "Right"},
+        "y_axis": {"name": "Social", "negative": "Authoritarian", "positive": "Libertarian"},
+    }
 
 
-def _normalize_family(fam: Any) -> str:
+def _axis_directions_from_strengths(axis_strengths: Dict[str, Any]) -> Dict[str, str]:
+    axis = _as_dict(axis_strengths)
+    soc = _as_dict(axis.get("social"))
+    eco = _as_dict(axis.get("economic"))
+
+    s_lib = _as_float(soc.get("libertarian"), 0.0)
+    s_auth = _as_float(soc.get("authoritarian"), 0.0)
+    s_total = _as_float(soc.get("total"), s_lib + s_auth)
+
+    e_left = _as_float(eco.get("left"), 0.0)
+    e_right = _as_float(eco.get("right"), 0.0)
+    e_total = _as_float(eco.get("total"), e_left + e_right)
+
+    social_dir = ("Libertarian" if s_lib >= s_auth else "Authoritarian") if s_total > 0 else ""
+    economic_dir = ("Right" if e_right >= e_left else "Left") if e_total > 0 else ""
+    return {"social": social_dir, "economic": economic_dir}
+
+
+def _empty_2d() -> Dict[str, Any]:
+    return {
+        "axis_labels": _axis_labels_block(),
+        "axis_strengths": {
+            "social": {"libertarian": 0.0, "authoritarian": 0.0, "total": 0.0},
+            "economic": {"left": 0.0, "right": 0.0, "total": 0.0},
+        },
+        "coordinates": {"social": 0.0, "economic": 0.0},
+        "coordinates_xy": {"x": 0.0, "y": 0.0},
+        "confidence_2d": {"social": 0.0, "economic": 0.0, "overall": 0.0},
+        "confidence": {"social": 0.0, "economic": 0.0, "overall": 0.0},
+        "quadrant_2d": {"magnitude": 0.0, "axis_directions": {"social": "", "economic": ""}},
+    }
+
+
+def _has_2d_mass(ide2d: Any) -> bool:
+    if not isinstance(ide2d, dict):
+        return False
+    axis = _as_dict(ide2d.get("axis_strengths"))
+    soc = _as_dict(axis.get("social"))
+    eco = _as_dict(axis.get("economic"))
+    soc_total = _as_float(soc.get("total"), 0.0)
+    eco_total = _as_float(eco.get("total"), 0.0)
+    return (soc_total > 0.0) or (eco_total > 0.0)
+
+
+def _sanitize_ideology_2d(block: Any) -> Dict[str, Any]:
+    if not isinstance(block, dict) or not block:
+        return _empty_2d()
+
+    out = dict(block)
+    out["axis_labels"] = _axis_labels_block()
+
+    axis = _as_dict(out.get("axis_strengths"))
+    soc = _as_dict(axis.get("social"))
+    eco = _as_dict(axis.get("economic"))
+
+    s_lib = _as_float(soc.get("libertarian"), 0.0)
+    s_auth = _as_float(soc.get("authoritarian"), 0.0)
+    e_left = _as_float(eco.get("left"), 0.0)
+    e_right = _as_float(eco.get("right"), 0.0)
+
+    axis_strengths = {
+        "social": {"libertarian": s_lib, "authoritarian": s_auth, "total": s_lib + s_auth},
+        "economic": {"left": e_left, "right": e_right, "total": e_left + e_right},
+    }
+    out["axis_strengths"] = axis_strengths
+
+    coords = _as_dict(out.get("coordinates"))
+    social = round(_as_float(coords.get("social"), 0.0), 3)
+    econ = round(_as_float(coords.get("economic"), 0.0), 3)
+    out["coordinates"] = {"social": social, "economic": econ}
+    out["coordinates_xy"] = {"x": econ, "y": social}
+
+    c2d = _as_dict(out.get("confidence_2d") or out.get("confidence") or {})
+    conf = {
+        "social": round(_as_float(c2d.get("social"), 0.0), 3),
+        "economic": round(_as_float(c2d.get("economic"), 0.0), 3),
+        "overall": round(_as_float(c2d.get("overall"), 0.0), 3),
+    }
+    out["confidence_2d"] = conf
+    out["confidence"] = dict(conf)
+
+    out.pop("families_2d", None)
+
+    mag = (social * social + econ * econ) ** 0.5
+    out["quadrant_2d"] = {"magnitude": round(mag, 3), "axis_directions": _axis_directions_from_strengths(axis_strengths)}
+    return out
+
+
+def _extract_ideology_2d_anywhere(full_results_any: Any) -> Dict[str, Any]:
+    fr = _safe_full_results(full_results_any)
+    candidates = [
+        fr.get("ideology_2d"),
+        _as_dict(fr.get("speech_level")).get("ideology_2d"),
+        _as_dict(fr.get("metadata")).get("ideology_2d"),
+    ]
+    for c in candidates:
+        if isinstance(c, dict) and isinstance(c.get("axis_strengths"), dict):
+            return _sanitize_ideology_2d(c)
+    return _empty_2d()
+
+
+def _dominant_family_from_2d(ideology_2d: Dict[str, Any]) -> str:
+    axis = _as_dict(ideology_2d.get("axis_strengths"))
+    soc = _as_dict(axis.get("social"))
+    eco = _as_dict(axis.get("economic"))
+    s_total = _as_float(soc.get("total"), 0.0)
+    e_total = _as_float(eco.get("total"), 0.0)
+
+    if s_total > 0:
+        return LIB_FAMILY if _as_float(soc.get("libertarian"), 0.0) >= _as_float(soc.get("authoritarian"), 0.0) else AUTH_FAMILY
+    if e_total > 0:
+        return ECON_RIGHT if _as_float(eco.get("right"), 0.0) >= _as_float(eco.get("left"), 0.0) else ECON_LEFT
+    return CENTRIST_FAMILY
+
+
+def _sum_axis_strengths_from_items(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Canonical family normalization for API:
-    - Always emits one of: Libertarian | Authoritarian | Centrist
-    - Unknown or legacy values -> Centrist
+    Fallback: aggregate axis_strengths from per-item ideology_2d blocks.
+    Only counts ideologically-labeled items (not Centrist).
     """
-    f = str(fam or "").strip()
-    if not f:
-        return CENTRIST_FAMILY
-    if f == LEGACY_NEUTRAL:
-        return CENTRIST_FAMILY
-    if f not in _ALLOWED_FAMILIES:
-        return CENTRIST_FAMILY
-    return f
+    s_lib = s_auth = e_left = e_right = 0.0
+
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        fam = _normalize_family(it.get("ideology_family"))
+        if fam not in _IDEOLOGICAL_FAMILIES:
+            continue
+        b = it.get("ideology_2d")
+        if not isinstance(b, dict):
+            continue
+        axis = _as_dict(b.get("axis_strengths"))
+        soc = _as_dict(axis.get("social"))
+        eco = _as_dict(axis.get("economic"))
+        s_lib += _as_float(soc.get("libertarian"), 0.0)
+        s_auth += _as_float(soc.get("authoritarian"), 0.0)
+        e_left += _as_float(eco.get("left"), 0.0)
+        e_right += _as_float(eco.get("right"), 0.0)
+
+    social_total = s_lib + s_auth
+    econ_total = e_left + e_right
+
+    social_coord = (s_lib - s_auth) / social_total if social_total > 0 else 0.0
+    econ_coord = (e_right - e_left) / econ_total if econ_total > 0 else 0.0
+
+    out = _empty_2d()
+    out["axis_strengths"] = {
+        "social": {"libertarian": round(s_lib, 6), "authoritarian": round(s_auth, 6), "total": round(social_total, 6)},
+        "economic": {"left": round(e_left, 6), "right": round(e_right, 6), "total": round(econ_total, 6)},
+    }
+    out["coordinates"] = {"social": round(float(social_coord), 3), "economic": round(float(econ_coord), 3)}
+    out["coordinates_xy"] = {"x": out["coordinates"]["economic"], "y": out["coordinates"]["social"]}
+    out["quadrant_2d"] = {
+        "magnitude": round(float((social_coord * social_coord + econ_coord * econ_coord) ** 0.5), 3),
+        "axis_directions": _axis_directions_from_strengths(out["axis_strengths"]),
+    }
+    return _sanitize_ideology_2d(out)
 
 
-def _normalize_subtype(family: str, subtype: Any) -> Optional[str]:
-    """
-    Policy:
-    - Centrist has no subtype.
-    - Lib/Auth subtype: keep if non-empty.
-    """
-    fam = _normalize_family(family)
-    if fam == CENTRIST_FAMILY:
-        return None
-    sub = str(subtype).strip() if subtype is not None else ""
-    return sub or None
+# =============================================================================
+# EVIDENCE NORMALIZATION
+# =============================================================================
+def _coerce_evidence_item(it: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(it, dict):
+        return {}
+    fam = _normalize_family(it.get("ideology_family") or it.get("family") or it.get("dominant_family") or it.get("label_family"))
+    sub = _normalize_subtype(fam, it.get("ideology_subtype") or it.get("subtype") or it.get("dominant_subtype") or it.get("label_subtype"))
+    txt = str(it.get("text") or it.get("full_text") or it.get("content") or "")
+    out = dict(it)
+    out["ideology_family"] = fam
+    out["ideology_subtype"] = sub
+    out["text"] = txt
+    out.setdefault("full_text", txt)
 
+    if "start_char" in out:
+        out["start_char"] = _as_int(out.get("start_char"), 0)
+    if "end_char" in out:
+        out["end_char"] = _as_int(out.get("end_char"), out.get("start_char", 0))
 
-def _sanitize_scores_dict(scores: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ensure scores dict uses Centrist key, never Neutral.
-    If both present, Centrist wins.
-    """
-    if not isinstance(scores, dict):
-        return {LIB_FAMILY: 0.0, AUTH_FAMILY: 0.0, CENTRIST_FAMILY: 0.0}
+    if out.get("confidence_score") is None and out.get("confidence") is not None:
+        out["confidence_score"] = out.get("confidence")
+    out["confidence_score"] = _as_float(out.get("confidence_score"), 0.0)
 
-    out = dict(scores)
+    out["evidence_count"] = _as_int(out.get("evidence_count"), 0)
+    out["signal_strength"] = _as_float(out.get("signal_strength"), 0.0)
 
-    # If Centrist missing but legacy Neutral exists, move it.
-    if CENTRIST_FAMILY not in out and LEGACY_NEUTRAL in out:
-        out[CENTRIST_FAMILY] = out.get(LEGACY_NEUTRAL)
+    mc = out.get("marpor_codes") or []
+    out["marpor_codes"] = [str(x).strip() for x in (mc if isinstance(mc, list) else []) if str(x).strip()]
 
-    # Remove legacy Neutral key always
-    out.pop(LEGACY_NEUTRAL, None)
-
-    # Make sure canonical keys exist
-    out.setdefault(LIB_FAMILY, 0.0)
-    out.setdefault(AUTH_FAMILY, 0.0)
-    out.setdefault(CENTRIST_FAMILY, 0.0)
+    if "ideology_2d" in out:
+        out["ideology_2d"] = _sanitize_ideology_2d(out.get("ideology_2d"))
 
     return out
 
 
-def _has_evidence_for_family(
-    speech_level: Dict[str, Any],
-    family: str,
-) -> bool:
-    """
-    Robust evidence presence check:
-    Preferred: speech_level.diagnostics.{lib_evidence_count,auth_evidence_count}
-    Fallback: speech_level.subtype_breakdown evidence_count by subtype naming
-    """
-    if not isinstance(speech_level, dict):
-        return False
+def _coerce_argument_span(sp: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(sp, dict):
+        return {}
+    out = dict(sp)
+    out["role"] = str(out.get("role") or "transition").strip() or "transition"
+    sr = out.get("sentence_range")
+    out["sentence_range"] = [_as_int(sr[0], 0), _as_int(sr[1], 0)] if isinstance(sr, (list, tuple)) and len(sr) == 2 else [0, 0]
+    out["start_char"] = _as_int(out.get("start_char"), 0)
+    out["end_char"] = _as_int(out.get("end_char"), out["start_char"])
+    out["text"] = str(out.get("text") or "")
+    out["segment_count"] = _as_int(out.get("segment_count"), 0)
+    out["evidence_sentence_count_2d"] = _as_int(out.get("evidence_sentence_count_2d"), 0)
+    out["evidence_sentence_count"] = _as_int(out.get("evidence_sentence_count"), out["evidence_sentence_count_2d"])
+    out["ideology_2d"] = _sanitize_ideology_2d(out.get("ideology_2d"))
+    out["labels"] = _as_dict(out.get("labels"))
+    return out
 
-    fam = _normalize_family(family)
-    diagnostics = speech_level.get("diagnostics") or {}
-    if isinstance(diagnostics, dict):
-        if fam == LIB_FAMILY:
-            c = diagnostics.get("lib_evidence_count", None)
-            if isinstance(c, (int, float)) and int(c) > 0:
-                return True
-        if fam == AUTH_FAMILY:
-            c = diagnostics.get("auth_evidence_count", None)
-            if isinstance(c, (int, float)) and int(c) > 0:
-                return True
 
-    subtype_breakdown = speech_level.get("subtype_breakdown", {})
-    if not isinstance(subtype_breakdown, dict) or not subtype_breakdown:
-        return False
+def _coerce_argument_unit(u: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(u, dict):
+        return {}
+    out = dict(u)
+    out["argument_unit_index"] = _as_int(out.get("argument_unit_index"), 0)
+    sr = out.get("sentence_range")
+    out["sentence_range"] = [_as_int(sr[0], 0), _as_int(sr[1], 0)] if isinstance(sr, (list, tuple)) and len(sr) == 2 else [0, 0]
+    out["start_char"] = _as_int(out.get("start_char"), 0)
+    out["end_char"] = _as_int(out.get("end_char"), out["start_char"])
+    out["text"] = str(out.get("text") or "")
+    out["ideology_2d"] = _sanitize_ideology_2d(out.get("ideology_2d"))
 
-    fam_lower = fam.lower()
-    for subtype_name, subtype_data in subtype_breakdown.items():
-        if not isinstance(subtype_data, dict):
+    spans = out.get("spans")
+    out["spans"] = [_coerce_argument_span(x) for x in (spans if isinstance(spans, list) else []) if isinstance(x, dict)]
+
+    out["pivot_detected"] = bool(out.get("pivot_detected", False))
+    pa = out.get("pivot_axes")
+    out["pivot_axes"] = [str(x).strip() for x in (pa if isinstance(pa, list) else []) if str(x).strip()]
+    return out
+
+
+# =============================================================================
+# ANALYSIS SUMMARY BUILDER (UNIT COUNTS)
+# =============================================================================
+def _ensure_summary_aliases(summary: Any) -> Dict[str, Any]:
+    if not isinstance(summary, dict):
+        return {"evidence_counts": {}, "total_evidence": 0}
+    out = dict(summary)
+
+    if "evidence_counts" not in out:
+        counts = out.get("statement_counts_by_family_ideology")
+        out["evidence_counts"] = counts if isinstance(counts, dict) else {}
+
+    if "total_evidence" not in out:
+        if "ideological_statements" in out:
+            out["total_evidence"] = int(_as_int(out.get("ideological_statements"), 0))
+        else:
+            ec = out.get("evidence_counts") if isinstance(out.get("evidence_counts"), dict) else {}
+            out["total_evidence"] = int(sum(int(_as_int(v, 0)) for v in ec.values()))
+
+    return out
+
+
+def _build_analysis_summary_from_full_results(full_results_any: Any) -> Dict[str, Any]:
+    fr = _safe_full_results(full_results_any)
+
+    statements = fr.get("statements") if isinstance(fr.get("statements"), list) else None
+    if statements is None:
+        base = fr.get("sections") or fr.get("segments") or fr.get("statement_list") or []
+        statements = base if isinstance(base, list) else []
+
+    key_statements = fr.get("key_statements") if isinstance(fr.get("key_statements"), list) else []
+
+    ideology_counts = {LIB_FAMILY: 0, AUTH_FAMILY: 0, ECON_LEFT: 0, ECON_RIGHT: 0}
+    subtype_counts_by_family: Dict[str, Dict[str, int]] = {LIB_FAMILY: {}, AUTH_FAMILY: {}}
+
+    total_statements = 0
+    ideological_statements = 0
+    non_ideology_statement_count = 0
+
+    total_evidence_count_weighted = 0
+    w_conf_num = w_sig_num = w_den = 0.0
+    marpor_union = set()
+
+    for raw in statements:
+        if not isinstance(raw, dict):
             continue
-        subtype_lower = str(subtype_name).lower()
-        if fam_lower not in subtype_lower:
-            continue
-        evidence_count = subtype_data.get("evidence_count", 0)
-        if isinstance(evidence_count, (int, float)) and int(evidence_count) > 0:
-            return True
+        st = _coerce_evidence_item(raw)
+        fam = _normalize_family(st.get("ideology_family"))
+        sub = st.get("ideology_subtype")
 
-    return False
-
-
-def _extract_scores_top(payload: Dict[str, Any]) -> Tuple[float, float, float, float, str, Optional[str], List[str]]:
-    """
-    Returns:
-      lib, auth, centrist, conf, dominant_family, dominant_subtype, marpor_codes
-
-    Accepts legacy 'Neutral' if present but never returns it.
-    Applies evidence-validation to avoid ghost scores.
-    """
-    payload = payload or {}
-    speech_level = payload.get("speech_level") or {}
-
-    # Preferred: speech_level.scores
-    if isinstance(speech_level, dict) and isinstance(speech_level.get("scores"), dict):
-        scores = _sanitize_scores_dict(speech_level.get("scores") or {})
-
-        lib = _as_float(scores.get(LIB_FAMILY), 0.0)
-        auth = _as_float(scores.get(AUTH_FAMILY), 0.0)
-        cen = _as_float(scores.get(CENTRIST_FAMILY), 0.0)
-
-        conf = _as_float(speech_level.get("confidence_score"), 0.0)
-
-        dom_fam_raw = speech_level.get("dominant_family") or payload.get("ideology_family") or CENTRIST_FAMILY
-        dom_sub_raw = speech_level.get("dominant_subtype") or payload.get("ideology_subtype")
-
-        dom_fam = _normalize_family(dom_fam_raw)
-        dom_sub = _normalize_subtype(dom_fam, dom_sub_raw)
-
-        marpor_codes = speech_level.get("marpor_codes") or payload.get("marpor_codes") or []
-        if isinstance(marpor_codes, list):
-            marpor_codes = [str(x) for x in marpor_codes if str(x).strip()]
+        total_statements += 1
+        if fam in _IDEOLOGICAL_FAMILIES:
+            ideological_statements += 1
+            ideology_counts[fam] = ideology_counts.get(fam, 0) + 1
+            if fam in (LIB_FAMILY, AUTH_FAMILY) and sub:
+                m = subtype_counts_by_family.setdefault(fam, {})
+                m[sub] = int(m.get(sub, 0)) + 1
         else:
-            marpor_codes = []
+            non_ideology_statement_count += 1
 
-        # Evidence validation: if no evidence for a family, zero it, then renormalize
-        lib_has = _has_evidence_for_family(speech_level, LIB_FAMILY)
-        auth_has = _has_evidence_for_family(speech_level, AUTH_FAMILY)
+        w = max(1.0, _as_float(st.get("sentence_count") or st.get("segment_count") or 1.0, 1.0))
+        w_conf_num += _as_float(st.get("confidence_score"), 0.0) * w
+        w_sig_num += _as_float(st.get("signal_strength"), 0.0) * w
+        w_den += w
 
-        if not lib_has:
-            lib = 0.0
-        if not auth_has:
-            auth = 0.0
+        total_evidence_count_weighted += _as_int(st.get("evidence_count"), 0)
 
-        total = lib + auth + cen
-        if total > 0:
-            lib = (lib / total) * 100.0
-            auth = (auth / total) * 100.0
-            cen = (cen / total) * 100.0
-        else:
-            lib, auth, cen = 0.0, 0.0, 100.0
+        for c in (st.get("marpor_codes") or []):
+            if (cs := str(c).strip()):
+                marpor_union.add(cs)
 
-        if lib == 0.0 and auth == 0.0:
-            dom_fam = CENTRIST_FAMILY
-            dom_sub = None
-        elif lib > 0 and auth == 0.0:
-            dom_fam = LIB_FAMILY
-        elif auth > 0 and lib == 0.0:
-            dom_fam = AUTH_FAMILY
+    for raw in key_statements:
+        if isinstance(raw, dict):
+            for c in (_coerce_evidence_item(raw).get("marpor_codes") or []):
+                if (cs := str(c).strip()):
+                    marpor_union.add(cs)
 
-        return lib, auth, cen, conf, dom_fam, dom_sub, marpor_codes
+    avg_conf = (w_conf_num / w_den) if w_den > 0 else 0.0
+    avg_sig = (w_sig_num / w_den) if w_den > 0 else 0.0
 
-    # Fallback: top-level scores
-    scores = payload.get("scores") or payload.get("overview", {}).get("scores") or {}
-    scores = _sanitize_scores_dict(scores) if isinstance(scores, dict) else _sanitize_scores_dict({})
-
-    lib = _as_float(payload.get("libertarian_score", scores.get(LIB_FAMILY)), 0.0)
-    auth = _as_float(payload.get("authoritarian_score", scores.get(AUTH_FAMILY)), 0.0)
-
-    cen = payload.get("centrist_score", None)
-    if cen is None:
-        cen = scores.get(CENTRIST_FAMILY)
-    if cen is None and LEGACY_NEUTRAL in (payload.get("scores") or {}):
-        cen = (payload.get("scores") or {}).get(LEGACY_NEUTRAL)
-    cen = _as_float(cen, 0.0)
-
-    conf = _as_float(payload.get("confidence_score") or payload.get("scientific_summary", {}).get("avg_confidence"), 0.0)
-
-    dom_fam_raw = payload.get("ideology_family") or payload.get("dominant_family") or CENTRIST_FAMILY
-    dom_sub_raw = payload.get("ideology_subtype") or payload.get("dominant_subtype")
-
-    dom_fam = _normalize_family(dom_fam_raw)
-    dom_sub = _normalize_subtype(dom_fam, dom_sub_raw)
-
-    marpor_codes = payload.get("marpor_codes") or []
-    if isinstance(marpor_codes, list):
-        marpor_codes = [str(x) for x in marpor_codes if str(x).strip()]
-    else:
-        marpor_codes = []
-
-    # Evidence validation (fallback path)
-    sl2 = payload.get("speech_level") or payload or {}
-    if isinstance(sl2, dict):
-        lib_has = _has_evidence_for_family(sl2, LIB_FAMILY)
-        auth_has = _has_evidence_for_family(sl2, AUTH_FAMILY)
-        if not lib_has:
-            lib = 0.0
-        if not auth_has:
-            auth = 0.0
-        total = lib + auth + cen
-        if total > 0:
-            lib = (lib / total) * 100.0
-            auth = (auth / total) * 100.0
-            cen = (cen / total) * 100.0
-        else:
-            lib, auth, cen = 0.0, 0.0, 100.0
-        if lib == 0.0 and auth == 0.0:
-            dom_fam = CENTRIST_FAMILY
-            dom_sub = None
-
-    return lib, auth, cen, conf, dom_fam, dom_sub, marpor_codes
+    summary = {
+        "statement_counts_by_family_ideology": ideology_counts,
+        "evidence_counts": ideology_counts,
+        "non_ideological_statement_count": int(non_ideology_statement_count),
+        "subtype_counts_by_family": subtype_counts_by_family,
+        "total_statements": int(total_statements),
+        "ideological_statements": int(ideological_statements),
+        "total_evidence_count": int(total_evidence_count_weighted),  # diagnostic
+        "total_evidence": int(ideological_statements),  # UI units
+        "avg_confidence_score": round(float(avg_conf), 4),
+        "avg_signal_strength": round(float(avg_sig), 2),
+        "key_statement_count": int(len([x for x in key_statements if isinstance(x, dict)])),
+        "marpor_codes": sorted(marpor_union),
+        "notes": ["Metadata-only summary derived from evidence-labeled statements."],
+    }
+    return _ensure_summary_aliases(summary)
 
 
+# =============================================================================
+# MEDIA TIME MAPPING
+# =============================================================================
 def _estimate_time_from_char(start_char: Optional[int], total_chars: int, duration: float) -> Optional[float]:
-    if start_char is None:
+    if start_char is None or total_chars <= 0 or duration <= 0:
         return None
-    if total_chars <= 0 or duration <= 0:
-        return None
-    frac = _clamp(start_char / total_chars, 0.0, 1.0)
-    return round(frac * duration, 3)
+    return round(_clamp(start_char / total_chars, 0.0, 1.0) * duration, 3)
 
 
 def _ensure_time_fields_for_items(
@@ -382,7 +592,6 @@ def _ensure_time_fields_for_items(
 ) -> None:
     if not items or transcript_len <= 0 or duration <= 0:
         return
-
     n = len(items)
     for i, it in enumerate(items):
         if not isinstance(it, dict):
@@ -395,11 +604,8 @@ def _ensure_time_fields_for_items(
                 sc_int = int(sc) if sc is not None else None
             except Exception:
                 sc_int = None
-
             t = _estimate_time_from_char(sc_int, transcript_len, duration)
-            if t is None:
-                t = round(((i + 1) / (n + 1)) * duration, 3)
-            it[out_begin_key] = t
+            it[out_begin_key] = t if t is not None else round(((i + 1) / (n + 1)) * duration, 3)
 
         te = it.get(out_end_key)
         if not isinstance(te, (int, float)) or _as_float(te, -1.0) < 0:
@@ -408,13 +614,10 @@ def _ensure_time_fields_for_items(
                 ec_int = int(ec) if ec is not None else None
             except Exception:
                 ec_int = None
-
             t_end = _estimate_time_from_char(ec_int, transcript_len, duration)
             if t_end is None:
                 base = _as_float(it.get(out_begin_key), 0.0)
-                nudge = min(1.5, max(0.25, duration * 0.01))
-                t_end = round(_clamp(base + nudge, 0.0, duration), 3)
-
+                t_end = round(_clamp(base + min(1.5, max(0.25, duration * 0.01)), 0.0, duration), 3)
             it[out_end_key] = t_end
 
 
@@ -424,654 +627,1141 @@ def _apply_media_jump_time_support(payload: Dict[str, Any], duration: Optional[f
     if dur <= 0:
         return payload
 
-    transcript_text = payload.get("transcript_text") or payload.get("text") or ""
-    transcript_len = len(transcript_text) if isinstance(transcript_text, str) else 0
+    transcript = payload.get("text") or payload.get("transcript_text") or ""
+    transcript_len = len(transcript) if isinstance(transcript, str) else 0
     if transcript_len <= 0:
         return payload
 
-    for key in ("key_statements", "segments", "sections"):
+    for key in ("key_statements", "statements", "sections", "segments", "statement_list", "argument_units"):
         arr = payload.get(key)
         if isinstance(arr, list):
-            _ensure_time_fields_for_items(
-                items=[x for x in arr if isinstance(x, dict)],
-                transcript_len=transcript_len,
-                duration=dur,
-            )
+            _ensure_time_fields_for_items([x for x in arr if isinstance(x, dict)], transcript_len, dur)
+
+    au = payload.get("argument_units")
+    if isinstance(au, list):
+        for u in au:
+            if isinstance(u, dict) and isinstance(u.get("spans"), list):
+                _ensure_time_fields_for_items([x for x in u["spans"] if isinstance(x, dict)], transcript_len, dur)
 
     return payload
 
 
-def _normalize_analysis_shape(data: Dict[str, Any], *, speech: Speech) -> Dict[str, Any]:
-    """
-    Ensure the analysis JSON has consistent keys expected by frontend:
-    - text + transcript_text
-    - key_statements array
-    - segments/sections arrays (both)
-    """
-    out: Dict[str, Any] = dict(data or {})
+# =============================================================================
+# AUTH / PERMISSIONS
+# =============================================================================
+def optional_current_user_dep() -> Any:
+    if _AUTH_AVAILABLE and get_current_user is not None:
+        return Depends(get_current_user)
 
-    text = (speech.text or "") if speech else (out.get("text") or out.get("transcript_text") or "")
-    out["text"] = text
-    out["transcript_text"] = text
+    async def _none() -> None:
+        return None
 
-    out.setdefault("title", getattr(speech, "title", None))
-    out.setdefault("speaker", getattr(speech, "speaker", None))
-
-    if not isinstance(out.get("key_statements"), list):
-        for alt in ("key_segments", "highlights"):
-            if isinstance(out.get(alt), list):
-                out["key_statements"] = out.get(alt)
-                break
-
-    if not isinstance(out.get("key_statements"), list):
-        sl = out.get("speech_level")
-        if isinstance(sl, dict) and isinstance(sl.get("key_statements"), list):
-            out["key_statements"] = sl.get("key_statements")
-
-    if isinstance(out.get("sections"), list) and not isinstance(out.get("segments"), list):
-        out["segments"] = out["sections"]
-    if isinstance(out.get("segments"), list) and not isinstance(out.get("sections"), list):
-        out["sections"] = out["segments"]
-
-    return out
+    return Depends(_none)
 
 
-def _purge_legacy_neutral_everywhere(obj: Any) -> Any:
-    """
-    Recursively:
-      - Sanitize any 'scores' dict to ensure Centrist/never Neutral.
-      - Normalize family/subtype keys:
-          * family keys: ideology_family, dominant_family, family
-          * subtype keys: ideology_subtype, dominant_subtype, subtype
-        Ensure: Centrist => subtype=None.
-      - Leaves unrelated keys untouched.
-    """
-    if isinstance(obj, dict):
-        out = {}
-        for k, v in obj.items():
-            out[k] = _purge_legacy_neutral_everywhere(v)
-
-        # Sanitize any nested scores
-        if isinstance(out.get("scores"), dict):
-            out["scores"] = _sanitize_scores_dict(out["scores"])
-
-        # Normalize family/subtype pairs commonly used in payloads
-        family_keys = ("ideology_family", "dominant_family", "family")
-        subtype_keys = ("ideology_subtype", "dominant_subtype", "subtype")
-
-        detected_fam_key = next((fk for fk in family_keys if fk in out), None)
-        if detected_fam_key:
-            fam = _normalize_family(out.get(detected_fam_key))
-            out[detected_fam_key] = fam
-            for sk in subtype_keys:
-                if sk in out:
-                    out[sk] = _normalize_subtype(fam, out.get(sk))
-
-        return out
-
-    if isinstance(obj, list):
-        return [_purge_legacy_neutral_everywhere(x) for x in obj]
-
-    return obj
+def _require_auth_if_enabled(user: Optional[User]) -> None:
+    if _AUTH_AVAILABLE and user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
 
 
-async def _generate_questions_safe(
-    *,
-    include_questions: bool,
-    question_types: List[str],
-    llm_provider: str,
-    llm_model: str,
-    max_questions: int,
-    speech_title: str,
-    speaker: str,
-    ideology_result: Dict[str, Any],
-    key_segments: List[Dict[str, Any]],
-) -> List[str]:
-    if not include_questions:
-        return []
-    if not _QUESTION_GENERATOR_AVAILABLE or question_generator is None:
-        return []
+def _is_admin(user: Optional[User]) -> bool:
+    if not user:
+        return False
+    return bool(getattr(user, "is_admin", False)) or bool(getattr(user, "role", None) == "admin")
 
-    qtypes = _normalize_question_types(question_types)
-    max_q = max(1, min(int(max_questions or 6), 8))
-    per_type = max(1, min(8, max_q // max(1, len(qtypes))))
 
-    out: List[str] = []
-    for qt in qtypes:
+def _can_read(speech: Speech, user: Optional[User]) -> bool:
+    if getattr(speech, "is_public", False):
+        return True
+    if user is None:
+        return False
+    return getattr(speech, "user_id", None) == user.id or _is_admin(user)
+
+
+def _require_write_access(speech: Speech, user: Optional[User]) -> None:
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+    if getattr(speech, "user_id", None) == user.id or _is_admin(user):
+        return
+    raise HTTPException(status_code=403, detail="Not permitted")
+
+
+# =============================================================================
+# EMBEDDER WRAPPER
+# =============================================================================
+class _STEmbedder:
+    def __init__(self, model_name: str):
+        if not _EMBEDDER_AVAILABLE or SentenceTransformer is None:
+            raise RuntimeError("sentence-transformers is not available")
+        self._model = SentenceTransformer(model_name)
+
+    def encode(self, texts: List[str], **kwargs) -> List[List[float]]:
+        kwargs.pop("show_progress_bar", None)
+        vecs = self._model.encode(texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
+        return [v.tolist() for v in vecs]
+
+
+def _get_embedder(use_semantic: bool = True) -> Optional[Any]:
+    global _global_embedder
+    if not use_semantic or not _EMBEDDER_AVAILABLE or SentenceTransformer is None:
+        return None
+    if _global_embedder is None:
         try:
-            qs = await question_generator.generate_questions_with_llm(
-                question_type=qt,
-                speech_title=speech_title or "",
-                speaker=speaker or "",
-                ideology_result=ideology_result or {},
-                key_segments=key_segments or [],
-                llm_provider=llm_provider,
-                llm_model=llm_model,
-                max_questions=per_type,
-            )
-            if isinstance(qs, list):
-                out.extend([str(x).strip() for x in qs if str(x).strip()])
+            _global_embedder = _STEmbedder(_EMBEDDER_MODEL)
+            logger.info("Loaded embedder model: %s", _EMBEDDER_MODEL)
         except Exception as e:
-            logger.warning("Question generation failed for type=%s: %s", qt, e, exc_info=True)
-
-    seen = set()
-    final: List[str] = []
-    for q in out:
-        if q in seen:
-            continue
-        seen.add(q)
-        final.append(q)
-    return final[:max_q]
+            logger.warning("Failed to load embedder: %s", e, exc_info=True)
+            _global_embedder = None
+    return _global_embedder
 
 
-async def _run_full_analysis(
-    *,
-    text: str,
-    title: str,
-    speaker: str,
-    use_semantic: bool,
-    threshold: float,
-    include_questions: bool,
-    question_types: List[str],
-    llm_provider: str,
-    llm_model: str,
-    max_questions: int,
-    media_duration_seconds: Optional[float],
+@contextmanager
+def _fresh_db_session() -> Session:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# =============================================================================
+# FILE EXTRACTION
+# =============================================================================
+def _extract_text_from_file(file_path: Path) -> str:
+    ext = file_path.suffix.lower()
+    if ext in TEXT_FORMATS:
+        return _clean_text(file_path.read_text(encoding="utf-8", errors="replace"))
+
+    if ext == ".pdf":
+        try:
+            import PyPDF2
+        except Exception:
+            raise HTTPException(status_code=500, detail="PDF processing requires PyPDF2")
+        try:
+            out = ""
+            with open(file_path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                for page in reader.pages:
+                    out += (page.extract_text() or "") + "\n"
+            return _clean_text(out)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to extract PDF text: {e}")
+
+    if ext in {".doc", ".docx"}:
+        try:
+            import docx
+        except Exception:
+            raise HTTPException(status_code=500, detail="Word processing requires python-docx")
+        try:
+            doc = docx.Document(str(file_path))
+            out = "\n".join([p.text for p in doc.paragraphs])
+            return _clean_text(out)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to extract Word text: {e}")
+
+    raise HTTPException(status_code=400, detail=f"Unsupported file format: {ext}")
+
+
+# =============================================================================
+# REQUEST MODELS
+# =============================================================================
+class SpeechCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field(..., min_length=1, max_length=500)
+    speaker: str = Field(..., min_length=1, max_length=200)
+    text: str = Field(..., min_length=MIN_TEXT_CHARS)
+    date: Optional[str] = Field(None)
+    location: Optional[str] = Field(None, max_length=200)
+    event: Optional[str] = Field(None, max_length=200)
+    source_url: Optional[str] = Field(None, max_length=500)
+    source_type: Optional[str] = Field(None, max_length=50)
+    language: str = Field("en", max_length=10)
+    is_public: bool = Field(False)
+    llm_provider: Optional[str] = Field("openai")
+    llm_model: Optional[str] = Field("gpt-4o-mini")
+    use_semantic_segmentation: bool = Field(True)
+    use_semantic_scoring: bool = Field(True)
+    analyze_immediately: bool = Field(True)
+
+    @field_validator("text")
+    @classmethod
+    def _text_not_empty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v or len(v) < MIN_TEXT_CHARS:
+            raise ValueError(f"Text too short (minimum {MIN_TEXT_CHARS} characters)")
+        return v
+
+
+class SpeechUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: Optional[str] = Field(None, min_length=1, max_length=500)
+    speaker: Optional[str] = Field(None, min_length=1, max_length=200)
+    text: Optional[str] = Field(None, min_length=MIN_TEXT_CHARS)
+    date: Optional[str] = Field(None)
+    location: Optional[str] = Field(None, max_length=200)
+    event: Optional[str] = Field(None, max_length=200)
+    source_url: Optional[str] = Field(None, max_length=500)
+    source_type: Optional[str] = Field(None, max_length=50)
+    language: Optional[str] = Field(None, max_length=10)
+    is_public: Optional[bool] = None
+
+
+class GenerateQuestionsBody(BaseModel):
+    """
+    Legacy compatibility endpoint body:
+    POST /speeches/{speech_id}/questions/generate
+
+    Frontend sometimes sends:
+      { speech_id, question_type, max_questions, llm_provider, llm_model }
+    """
+
+    speech_id: Optional[int] = None
+    question_type: str = Field(default="journalistic")
+    max_questions: int = Field(default=5, ge=1, le=8)
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
+
+
+# =============================================================================
+# CANONICALIZE FULL RESULTS (IMPORTANT)
+# =============================================================================
+def _canonicalize_full_results(*, speech: Speech, fr_in: Dict[str, Any]) -> Dict[str, Any]:
+    fr = dict(fr_in or {})
+
+    fr.setdefault("text", speech.text)
+    fr.setdefault("transcript_text", speech.text)
+    fr.setdefault("title", speech.title)
+    fr.setdefault("speaker", speech.speaker)
+
+    # canonical statements
+    statements: List[Dict[str, Any]] = []
+    if isinstance(fr.get("statements"), list):
+        statements = [_coerce_evidence_item(x) for x in fr["statements"] if isinstance(x, dict)]
+    else:
+        base = None
+        for k in ("sections", "segments", "statement_list"):
+            if isinstance(fr.get(k), list) and fr.get(k):
+                base = fr.get(k)
+                break
+        if isinstance(base, list):
+            statements = [_coerce_evidence_item(x) for x in base if isinstance(x, dict)]
+
+    fr["statements"] = statements
+    fr["sections"] = statements
+    fr["segments"] = statements
+    fr["statement_list"] = statements
+
+    if isinstance(fr.get("key_statements"), list):
+        fr["key_statements"] = [_coerce_evidence_item(x) for x in fr["key_statements"] if isinstance(x, dict)]
+    else:
+        fr["key_statements"] = []
+
+    if isinstance(fr.get("argument_units"), list):
+        fr["argument_units"] = [_coerce_argument_unit(x) for x in fr["argument_units"] if isinstance(x, dict)]
+    else:
+        fr["argument_units"] = []
+
+    # ideology_2d: prefer provided, else aggregate from items
+    ide2d = _extract_ideology_2d_anywhere(fr)
+    if not _has_2d_mass(ide2d) and statements:
+        ide2d = _sum_axis_strengths_from_items(statements)
+
+    fr["ideology_2d"] = _sanitize_ideology_2d(ide2d)
+
+    if isinstance(fr.get("speech_level"), dict):
+        fr["speech_level"]["ideology_2d"] = _sanitize_ideology_2d(fr["ideology_2d"])
+    else:
+        fr["speech_level"] = {"ideology_2d": _sanitize_ideology_2d(fr["ideology_2d"])}
+
+    # summary
+    if not isinstance(fr.get("analysis_summary"), dict):
+        fr["analysis_summary"] = _build_analysis_summary_from_full_results(fr)
+    fr["analysis_summary"] = _ensure_summary_aliases(fr["analysis_summary"])
+
+    return fr
+
+
+# =============================================================================
+# SPEECH -> DICT  (FIXED: canonicalize analysis.full_results)
+# =============================================================================
+def _speech_to_dict(
+    s: Speech,
+    include_text: bool = False,
+    include_analysis_summary: bool = True,
+    analysis: Optional[Analysis] = None,
 ) -> Dict[str, Any]:
-    if not _INGEST_AVAILABLE or ingest_speech is None:
-        raise HTTPException(status_code=503, detail="Analysis ingestion service is not available.")
+    d: Dict[str, Any] = {
+        "id": s.id,
+        "user_id": getattr(s, "user_id", None),
+        "title": s.title,
+        "speaker": s.speaker,
+        "date": s.date.isoformat() if s.date else None,
+        "location": s.location,
+        "event": s.event,
+        "language": s.language,
+        "word_count": s.word_count,
+        "source_url": s.source_url,
+        "source_type": s.source_type,
+        "media_url": getattr(s, "media_url", None),
+        "status": s.status,
+        "is_public": s.is_public,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+        "analyzed_at": s.analyzed_at.isoformat() if s.analyzed_at else None,
+        "llm_provider": s.llm_provider,
+        "llm_model": s.llm_model,
+        "use_semantic_segmentation": bool(getattr(s, "use_semantic_segmentation", True)),
+        "use_semantic_scoring": bool(getattr(s, "use_semantic_scoring", True)),
+        "has_analysis": bool(analysis is not None),
+    }
+    if include_text:
+        d["text"] = s.text
 
-    ingest_result = await ingest_speech(
-        text=text,
-        speech_title=title or "",
-        speaker=speaker or "",
-        use_semantic_scoring=bool(use_semantic),
-        code_threshold=float(threshold),
-    )
-    if not isinstance(ingest_result, dict):
-        raise HTTPException(status_code=500, detail="Ingestion pipeline returned invalid result.")
+    if include_analysis_summary and analysis is not None:
+        fr = _safe_full_results(getattr(analysis, "full_results", None))
+        fr = _canonicalize_full_results(speech=s, fr_in=fr)
+        d["analysis_summary"] = fr.get("analysis_summary") or _ensure_summary_aliases({})
+        d["ideology_2d"] = fr.get("ideology_2d") or _empty_2d()
 
-    if ingest_result.get("error"):
-        raise HTTPException(status_code=400, detail=str(ingest_result.get("error")))
-
-    merged: Dict[str, Any] = dict(ingest_result)
-    merged["text"] = text
-    merged["transcript_text"] = text
-
-    # ensure sections/segments symmetry
-    if isinstance(merged.get("sections"), list) and not isinstance(merged.get("segments"), list):
-        merged["segments"] = merged["sections"]
-    if isinstance(merged.get("segments"), list) and not isinstance(merged.get("sections"), list):
-        merged["sections"] = merged["segments"]
-
-    # sanitize speech_level.scores (if present)
-    sl = merged.get("speech_level")
-    if isinstance(sl, dict) and isinstance(sl.get("scores"), dict):
-        sl["scores"] = _sanitize_scores_dict(sl.get("scores") or {})
-
-    # NEW: deep sanitize the entire payload (no Neutral anywhere; Centrist has no subtype)
-    merged = _purge_legacy_neutral_everywhere(merged)
-
-    # Extract normalized top fields (with evidence validation)
-    lib, auth, cen, conf, dom_fam, dom_sub, marpor_codes = _extract_scores_top(merged)
-
-    # Always provide top-level canonical scores dict
-    merged["scores"] = {LIB_FAMILY: lib, AUTH_FAMILY: auth, CENTRIST_FAMILY: cen}
-    merged["ideology_family"] = dom_fam
-    merged["ideology_subtype"] = dom_sub
-    merged["libertarian_score"] = lib
-    merged["authoritarian_score"] = auth
-    merged["centrist_score"] = cen
-    merged["confidence_score"] = conf
-    merged["marpor_codes"] = marpor_codes
-
-    # Questions
-    merged["questions"] = []
-    if include_questions:
-        ideology_result_for_questions: Dict[str, Any] = {
-            "scores": merged.get("scores") or {},
-            "ideology_family": merged.get("ideology_family"),
-            "ideology_subtype": merged.get("ideology_subtype"),
-            "confidence_score": merged.get("confidence_score"),
-            "marpor_codes": merged.get("marpor_codes") or [],
-        }
-
-        key_segments_for_questions: List[Dict[str, Any]] = []
-        ks = merged.get("key_statements")
-        if isinstance(ks, list):
-            for item in ks[:6]:
-                if isinstance(item, dict):
-                    key_segments_for_questions.append({"text": item.get("text") or item.get("full_text") or ""})
-
-        merged["questions"] = await _generate_questions_safe(
-            include_questions=True,
-            question_types=question_types,
-            llm_provider=llm_provider,
-            llm_model=llm_model,
-            max_questions=max_questions,
-            speech_title=title or "",
-            speaker=speaker or "",
-            ideology_result=ideology_result_for_questions,
-            key_segments=key_segments_for_questions,
-        )
-
-    merged = _apply_media_jump_time_support(merged, duration=media_duration_seconds)
-    return merged
+    return d
 
 
-def _get_speech_llm_provider_model(speech: Speech, req_provider: Optional[str], req_model: Optional[str]) -> Tuple[str, str]:
-    provider = (req_provider or getattr(speech, "llm_provider", None) or "openai").strip()
-    model = (req_model or getattr(speech, "llm_model", None) or "gpt-4o-mini").strip()
-    return provider, model
+# =============================================================================
+# ANALYSIS UPSERT
+# =============================================================================
+def _upsert_analysis_row(
+    db: Session,
+    *,
+    speech: Speech,
+    full_results: Dict[str, Any],
+    processing_time_seconds: Optional[float],
+) -> Analysis:
+    fr = _canonicalize_full_results(speech=speech, fr_in=full_results)
 
+    summary = fr.get("analysis_summary") if isinstance(fr.get("analysis_summary"), dict) else {}
+    conf = _as_float(summary.get("avg_confidence_score"), 0.0)
+    marpor_codes = [str(x).strip() for x in (summary.get("marpor_codes") or []) if str(x).strip()]
 
-def _persist_analysis_upsert(db: Session, *, speech_id: int, merged: Dict[str, Any]) -> Analysis:
-    """
-    Persist analysis. DB schema may still be legacy (neutral_score). We write Centrist into:
-    - Analysis.centrist_score if present, else
-    - Analysis.neutral_score if present (compatibility until DB migration).
-    """
-    lib, auth, cen, conf, dom_fam, dom_sub, marpor_codes = _extract_scores_top(merged or {})
+    dom_family = _normalize_family(_dominant_family_from_2d(fr["ideology_2d"]))
+    dom_subtype = None
 
-    dom_fam = _normalize_family(dom_fam)
-    dom_sub = _normalize_subtype(dom_fam, dom_sub)
+    axis = _as_dict(_as_dict(fr["ideology_2d"]).get("axis_strengths"))
+    soc = _as_dict(axis.get("social"))
+    s_lib = _as_float(soc.get("libertarian"), 0.0)
+    s_auth = _as_float(soc.get("authoritarian"), 0.0)
+    s_tot = max(0.0, s_lib + s_auth)
 
-    existing = db.query(Analysis).filter(Analysis.speech_id == speech_id).first()
+    lib_score = round((s_lib / s_tot) * 100.0, 2) if s_tot > 0 else 0.0
+    auth_score = round((s_auth / s_tot) * 100.0, 2) if s_tot > 0 else 0.0
+
+    sl = _as_dict(fr.get("speech_level"))
+    total_sent = _as_float(sl.get("total_sentences"), 0.0)
+    cent_sent = _as_float(sl.get("centrist_sentences"), 0.0)
+    centrist_score = round((_clamp(cent_sent / total_sent, 0.0, 1.0) * 100.0), 2) if total_sent > 0 else 0.0
+
+    existing = db.query(Analysis).filter(Analysis.speech_id == speech.id).first()
     if existing:
-        existing.ideology_family = dom_fam
-        existing.ideology_subtype = dom_sub
-        existing.libertarian_score = float(lib)
-        existing.authoritarian_score = float(auth)
-
+        existing.ideology_family = dom_family
+        existing.ideology_subtype = dom_subtype
+        existing.libertarian_score = float(lib_score)
+        existing.authoritarian_score = float(auth_score)
         if hasattr(existing, "centrist_score"):
-            setattr(existing, "centrist_score", float(cen))
-        elif hasattr(existing, "neutral_score"):
-            # legacy compatibility only
-            setattr(existing, "neutral_score", float(cen))
-
+            existing.centrist_score = float(centrist_score)
         existing.confidence_score = float(conf)
-        existing.marpor_codes = list(marpor_codes or [])
-        existing.full_results = merged or {}
+        existing.marpor_codes = list(marpor_codes)
+        existing.full_results = fr
+
+        if hasattr(existing, "processing_time_seconds"):
+            existing.processing_time_seconds = float(processing_time_seconds) if processing_time_seconds is not None else None
+        if hasattr(existing, "key_statement_count"):
+            existing.key_statement_count = int(_as_int(summary.get("key_statement_count"), 0))
+        if hasattr(existing, "segment_count"):
+            existing.segment_count = int(len(fr.get("statements") or []))
         if hasattr(existing, "updated_at"):
             existing.updated_at = datetime.utcnow()
+
         db.add(existing)
         return existing
 
     created_kwargs: Dict[str, Any] = dict(
-        speech_id=speech_id,
-        ideology_family=dom_fam,
-        ideology_subtype=dom_sub,
-        libertarian_score=float(lib),
-        authoritarian_score=float(auth),
+        speech_id=speech.id,
+        ideology_family=dom_family,
+        ideology_subtype=dom_subtype,
+        libertarian_score=float(lib_score),
+        authoritarian_score=float(auth_score),
         confidence_score=float(conf),
-        marpor_codes=list(marpor_codes or []),
-        full_results=merged or {},
+        marpor_codes=list(marpor_codes),
+        full_results=fr,
         created_at=datetime.utcnow(),
     )
-
-    # legacy compatibility: choose available column
     if hasattr(Analysis, "centrist_score"):
-        created_kwargs["centrist_score"] = float(cen)
-    elif hasattr(Analysis, "neutral_score"):
-        created_kwargs["neutral_score"] = float(cen)
+        created_kwargs["centrist_score"] = float(centrist_score)
+    if hasattr(Analysis, "processing_time_seconds"):
+        created_kwargs["processing_time_seconds"] = float(processing_time_seconds) if processing_time_seconds is not None else None
+    if hasattr(Analysis, "key_statement_count"):
+        created_kwargs["key_statement_count"] = int(_as_int(summary.get("key_statement_count"), 0))
+    if hasattr(Analysis, "segment_count"):
+        created_kwargs["segment_count"] = int(len(fr.get("statements") or []))
 
     created = Analysis(**created_kwargs)
     db.add(created)
     return created
 
 
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
+# =============================================================================
+# BACKGROUND ANALYSIS
+# =============================================================================
+async def _run_analysis_and_persist(speech_id: int) -> None:
+    if not _INGEST_AVAILABLE or ingest_speech is None:
+        logger.error("ingest_speech not available; cannot analyze speech_id=%s", speech_id)
+        return
 
-@router.post("/speech")
-async def analyze_speech(req: AnalyzeSpeechRequest, db: Session = Depends(get_db)):
-    start = time.time()
-
-    speech: Optional[Speech] = None
-
-    if req.speech_id is not None:
-        speech = db.query(Speech).filter(Speech.id == req.speech_id).first()
+    with _fresh_db_session() as db:
+        speech = db.query(Speech).filter(Speech.id == speech_id).first()
         if not speech:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Speech not found.")
+            logger.error("Speech not found for analysis: %s", speech_id)
+            return
 
-        text = (speech.text or "").strip()
-        title = (speech.title or req.title or "Untitled Speech").strip()
-        spk = (speech.speaker or req.speaker or "Unknown").strip() or "Unknown"
-        provider, model = _get_speech_llm_provider_model(speech, req.llm_provider, req.llm_model)
-    else:
-        text = (req.text or "").strip()
-        title = (req.title or "Untitled Speech").strip()
-        spk = (req.speaker or "Unknown").strip() or "Unknown"
-        provider = (req.llm_provider or "openai").strip()
-        model = (req.llm_model or "gpt-4o-mini").strip()
-
-    if not text:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No speech text provided.")
-
-    # Create speech if needed
-    if speech is None:
         try:
-            speech = Speech(
-                title=title or "Untitled Speech",
-                speaker=spk,
-                text=text,
-                created_at=datetime.utcnow(),
-            )
-
-            if hasattr(speech, "language"):
-                speech.language = getattr(speech, "language", None) or "en"
-            if hasattr(speech, "word_count"):
-                speech.word_count = len(text.split())
-            if hasattr(speech, "status"):
-                speech.status = "pending"
-            if hasattr(speech, "is_public"):
-                speech.is_public = False
-            if hasattr(speech, "llm_provider"):
-                speech.llm_provider = provider
-            if hasattr(speech, "llm_model"):
-                speech.llm_model = model
-
-            if req.project_id and _PROJECT_AVAILABLE and Project is not None and hasattr(speech, "projects"):
-                proj = db.query(Project).filter(Project.id == req.project_id).first()
-                if proj:
-                    speech.projects.append(proj)
-
-            db.add(speech)
-            db.commit()
-            db.refresh(speech)
-        except Exception as e:
-            db.rollback()
-            logger.error("Failed to create Speech: %s", e, exc_info=True)
-            raise HTTPException(status_code=500, detail="Failed to create speech record.")
-
-    # Mark processing
-    try:
-        if hasattr(speech, "status"):
             speech.status = "processing"
-        db.commit()
-    except Exception:
-        db.rollback()
+            db.commit()
 
-    # Run analysis
+            use_sem_scoring = bool(getattr(speech, "use_semantic_scoring", True))
+            embedder = _get_embedder(use_semantic=use_sem_scoring)
+
+            # ✅ do NOT hard-code 0.6; keep consistent with ingestion default (recall-friendly)
+            code_threshold = float(DEFAULT_CODE_THRESHOLD)
+            code_threshold = _clamp(code_threshold, 0.10, 0.95)
+
+            t0 = time.time()
+            try:
+                result = await ingest_speech(
+                    text=speech.text,
+                    speech_title=speech.title or "",
+                    speaker=speech.speaker or "",
+                    use_semantic_scoring=use_sem_scoring,
+                    embedder=embedder,
+                    code_threshold=code_threshold,
+                )
+            except TypeError:
+                # Older signatures
+                result = await ingest_speech(
+                    text=speech.text,
+                    speech_title=speech.title or "",
+                    speaker=speech.speaker or "",
+                    use_semantic_scoring=use_sem_scoring,
+                    embedder=embedder,
+                )
+            dt = time.time() - t0
+
+            if isinstance(result, dict) and result.get("error"):
+                raise RuntimeError(str(result.get("error")))
+
+            fr = result if isinstance(result, dict) else _safe_full_results(result)
+            if not isinstance(fr, dict):
+                raise RuntimeError("Ingestion returned invalid result type")
+
+            # persist actual settings used (debuggable)
+            fr.setdefault("metadata", {})
+            if isinstance(fr.get("metadata"), dict):
+                fr["metadata"]["code_threshold"] = code_threshold
+                fr["metadata"]["use_semantic_scoring"] = bool(use_sem_scoring)
+
+            fr = _canonicalize_full_results(speech=speech, fr_in=fr)
+            analysis = _upsert_analysis_row(db, speech=speech, full_results=fr, processing_time_seconds=float(dt))
+
+            # optional question generation (store in DB)
+            if _QUESTION_GENERATOR_AVAILABLE and question_generator is not None:
+                try:
+                    summary = fr.get("analysis_summary") if isinstance(fr.get("analysis_summary"), dict) else {}
+                    ideology_result = {
+                        "ideology_family": "Evidence-labeled",
+                        "ideology_subtype": None,
+                        "confidence_score": _as_float(summary.get("avg_confidence_score"), 0.0),
+                        "marpor_codes": summary.get("marpor_codes") if isinstance(summary.get("marpor_codes"), list) else [],
+                        "scores": {LIB_FAMILY: 0.0, AUTH_FAMILY: 0.0, ECON_LEFT: 0.0, ECON_RIGHT: 0.0, CENTRIST_FAMILY: 0.0},
+                        "ideology_2d": fr.get("ideology_2d") or _extract_ideology_2d_anywhere(fr),
+                    }
+                    key_segments = [_coerce_evidence_item(x) for x in (fr.get("key_statements") or []) if isinstance(x, dict)]
+                    qs = await question_generator.generate_questions_with_llm(
+                        question_type="journalistic",
+                        speech_title=speech.title or "",
+                        speaker=speech.speaker or "",
+                        ideology_result=ideology_result,
+                        key_segments=key_segments[:6],
+                        llm_provider=speech.llm_provider or "openai",
+                        llm_model=speech.llm_model or "gpt-4o-mini",
+                        max_questions=3,
+                    )
+                    if isinstance(qs, list) and qs:
+                        db.query(Question).filter(Question.speech_id == speech.id).delete()
+                        for i, q_text in enumerate(qs):
+                            db.add(
+                                Question(
+                                    speech_id=speech.id,
+                                    question_text=str(q_text),
+                                    question_type="journalistic",
+                                    question_order=i,
+                                )
+                            )
+                except Exception as e:
+                    logger.warning("Speech %s: question generation failed: %s", speech_id, e, exc_info=True)
+
+            speech.status = "completed"
+            speech.analyzed_at = datetime.utcnow()
+            db.commit()
+            db.refresh(analysis)
+
+            logger.info("Analysis completed for speech_id=%s in %.2fs", speech_id, dt)
+
+        except Exception as e:
+            logger.error("Analysis failed for speech_id=%s: %s", speech_id, e, exc_info=True)
+            try:
+                speech.status = "failed"
+                speech.analyzed_at = None
+                db.commit()
+            except Exception:
+                db.rollback()
+
+
+# =============================================================================
+# ENDPOINTS
+# =============================================================================
+@router.post("/upload")
+async def upload_speech(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    speaker: str = Form(...),
+    date_str: Optional[str] = Form(None),
+    location: Optional[str] = Form(None),
+    event: Optional[str] = Form(None),
+    language: str = Form("en"),
+    is_public: bool = Form(False),
+    llm_provider: str = Form("openai"),
+    llm_model: str = Form("gpt-4o-mini"),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = optional_current_user_dep(),
+):
+    _require_auth_if_enabled(current_user)
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+
+    file_ext = Path(file.filename).suffix.lower()
+    all_formats = TEXT_FORMATS | DOCUMENT_FORMATS | AUDIO_FORMATS | VIDEO_FORMATS
+    if file_ext not in all_formats:
+        raise HTTPException(status_code=400, detail=f"Unsupported file format: {file_ext}")
+
+    needs_transcription = file_ext in (AUDIO_FORMATS | VIDEO_FORMATS)
+    if needs_transcription and not _TRANSCRIPTION_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Audio/video transcription not available.")
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    safe_filename = _safe_filename(file.filename, prefix=ts)
+    file_path = UPLOAD_DIR / safe_filename
+
     try:
-        merged = await _run_full_analysis(
-            text=text,
-            title=title,
-            speaker=spk,
-            use_semantic=req.use_semantic,
-            threshold=req.threshold,
-            include_questions=req.include_questions,
-            question_types=req.question_types,
-            llm_provider=provider,
-            llm_model=model,
-            max_questions=req.max_questions,
-            media_duration_seconds=req.media_duration_seconds,
-        )
+        with file_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
+
+    transcript = None
+    media_url = None
+    try:
+        if needs_transcription:
+            if transcribe_media_file is None:
+                raise HTTPException(status_code=503, detail="Transcription service not available")
+            tr = transcribe_media_file(
+                str(file_path),
+                language=None if language == "en" else language,
+                with_timestamps=False,
+            )
+            transcript = _clean_text((tr or {}).get("text", "") or "")
+            media_url = f"/media/uploads/{safe_filename}"
+        else:
+            transcript = _extract_text_from_file(file_path)
+            # non-media: delete extracted file after reading
+            try:
+                if file_path.exists():
+                    file_path.unlink()
+            except Exception:
+                pass
     except HTTPException:
         try:
-            if hasattr(speech, "status"):
-                speech.status = "failed"
-            db.commit()
+            if file_path.exists():
+                file_path.unlink()
         except Exception:
-            db.rollback()
+            pass
         raise
     except Exception as e:
-        logger.error("Analysis pipeline failed: %s", e, exc_info=True)
         try:
-            if hasattr(speech, "status"):
-                speech.status = "failed"
-            db.commit()
+            if file_path.exists():
+                file_path.unlink()
         except Exception:
-            db.rollback()
-        raise HTTPException(status_code=500, detail="Analysis pipeline failed.")
+            pass
+        raise HTTPException(status_code=500, detail=f"Failed to process file: {e}")
 
-    # Persist analysis
+    if not transcript or len(transcript.strip()) < MIN_TEXT_CHARS:
+        raise HTTPException(status_code=400, detail=f"Extracted text too short (min {MIN_TEXT_CHARS} chars)")
+
+    speech_date = None
+    if date_str:
+        try:
+            speech_date = _parse_iso_date(date_str)
+        except HTTPException:
+            speech_date = None
+
+    wc = _word_count(transcript)
+
     try:
-        analysis = _persist_analysis_upsert(db, speech_id=speech.id, merged=merged)
-
-        if hasattr(speech, "status"):
-            speech.status = "completed"
-        if hasattr(speech, "analyzed_at"):
-            speech.analyzed_at = datetime.utcnow()
-
+        db_speech = Speech(
+            user_id=(current_user.id if current_user else None),
+            title=title.strip(),
+            speaker=speaker.strip(),
+            text=transcript,
+            date=speech_date,
+            location=location,
+            event=event,
+            source_url=None,
+            source_type="upload",
+            media_url=media_url,
+            language=language or "en",
+            word_count=wc,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            use_semantic_segmentation=True,
+            use_semantic_scoring=True,
+            is_public=bool(is_public),
+            status="uploaded",
+        )
+        db.add(db_speech)
         db.commit()
-        db.refresh(analysis)
+        db.refresh(db_speech)
 
-        merged["analysis_id"] = analysis.id
-        merged["speech_id"] = speech.id
-        merged["analysis_persisted"] = True
-    except Exception as e:
+        if _INGEST_AVAILABLE and ingest_speech is not None:
+            background_tasks.add_task(_run_analysis_and_persist, db_speech.id)
+
+        return _response(
+            True,
+            data=_speech_to_dict(db_speech, include_text=False, include_analysis_summary=False, analysis=None),
+            message="File uploaded successfully. Analysis queued.",
+            meta={"speech_id": db_speech.id},
+        )
+    except SQLAlchemyError as e:
         db.rollback()
-        logger.error("Failed to persist Analysis: %s", e, exc_info=True)
-        merged["analysis_persisted"] = False
-        merged["analysis_persist_error"] = "Failed to persist analysis to database."
-        merged["speech_id"] = speech.id
+        # cleanup media file if DB write failed (only for audio/video uploads)
+        if media_url:
+            try:
+                if file_path.exists():
+                    file_path.unlink()
+            except Exception:
+                pass
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
-    return create_response(
-        success=True,
-        data=merged,
-        message="Analysis completed.",
-        processing_time=round(time.time() - start, 4),
-        timestamp=_now_z(),
+
+@router.post("/")
+async def create_speech(
+    payload: SpeechCreate,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = optional_current_user_dep(),
+):
+    _require_auth_if_enabled(current_user)
+
+    speech_date = _parse_iso_date(payload.date)
+    cleaned = _clean_text(payload.text)
+    wc = _word_count(cleaned)
+
+    try:
+        speech = Speech(
+            user_id=(current_user.id if current_user else None),
+            title=payload.title.strip(),
+            speaker=payload.speaker.strip(),
+            text=cleaned,
+            date=speech_date,
+            location=payload.location,
+            event=payload.event,
+            source_url=payload.source_url,
+            source_type=payload.source_type,
+            language=payload.language or "en",
+            word_count=wc,
+            llm_provider=payload.llm_provider,
+            llm_model=payload.llm_model,
+            use_semantic_segmentation=bool(payload.use_semantic_segmentation),
+            use_semantic_scoring=bool(payload.use_semantic_scoring),
+            is_public=bool(payload.is_public),
+            status="pending",
+        )
+        db.add(speech)
+        db.commit()
+        db.refresh(speech)
+
+        if payload.analyze_immediately and _INGEST_AVAILABLE and ingest_speech is not None:
+            background_tasks.add_task(_run_analysis_and_persist, speech.id)
+
+        return _response(True, data=_speech_to_dict(speech, include_text=False, include_analysis_summary=False, analysis=None))
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
+
+@router.get("/stats")
+async def stats(db: Session = Depends(get_db)):
+    total = int(db.execute(text("SELECT COUNT(*) FROM speeches")).scalar() or 0)
+    analyzed = int(db.execute(text("SELECT COUNT(*) FROM speeches s JOIN analyses a ON a.speech_id = s.id")).scalar() or 0)
+    avg_conf = db.execute(text("SELECT AVG(confidence_score) FROM analyses")).scalar()
+    return _response(
+        True,
+        data={
+            "total_speeches": int(total),
+            "analyzed_speeches": int(analyzed),
+            "pending_speeches": int(total - analyzed),
+            "average_confidence_score": round(float(avg_conf or 0.0), 4),
+        },
     )
 
 
-@router.get("/speech/{speech_id}")
-async def get_latest_analysis_for_speech(
-    speech_id: int,
-    media_duration_seconds: Optional[float] = Query(default=None, ge=0.0),
+@router.get("/search")
+async def search_speeches(
+    q: str = Query(..., min_length=2),
+    search_in: str = Query("all"),
+    include_public: bool = Query(False),
+    limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
+    current_user: Optional[User] = optional_current_user_dep(),
 ):
-    start = time.time()
+    term = f"%{q.strip()}%"
+    query = db.query(Speech)
 
+    if current_user is not None:
+        query = query.filter(or_(Speech.user_id == current_user.id, Speech.is_public == True)) if include_public else query.filter(Speech.user_id == current_user.id)
+    else:
+        query = query.filter(Speech.is_public == True)
+
+    if search_in == "title":
+        query = query.filter(Speech.title.ilike(term))
+    elif search_in == "speaker":
+        query = query.filter(Speech.speaker.ilike(term))
+    elif search_in == "text":
+        query = query.filter(Speech.text.ilike(term))
+    else:
+        query = query.filter(or_(Speech.title.ilike(term), Speech.speaker.ilike(term), Speech.text.ilike(term)))
+
+    speeches = query.order_by(Speech.created_at.desc()).limit(limit).all()
+    analysis_map = {a.speech_id: a for a in db.query(Analysis).filter(Analysis.speech_id.in_([s.id for s in speeches])).all()} if speeches else {}
+
+    return _response(
+        True,
+        data={
+            "speeches": [_speech_to_dict(s, include_text=False, include_analysis_summary=True, analysis=analysis_map.get(s.id)) for s in speeches],
+            "count": len(speeches),
+        },
+    )
+
+
+@router.get("/")
+async def list_speeches(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    include_public: bool = Query(False),
+    speaker: Optional[str] = Query(None),
+    status_filter: Optional[str] = Query(None, alias="status"),
+    has_analysis: Optional[bool] = Query(None),
+    is_public: Optional[bool] = Query(None),
+    sort_by: str = Query("created_at"),
+    sort_order: str = Query("desc"),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = optional_current_user_dep(),
+):
+    q = db.query(Speech)
+
+    if current_user is not None:
+        q = q.filter(or_(Speech.user_id == current_user.id, Speech.is_public == True)) if include_public else q.filter(Speech.user_id == current_user.id)
+    else:
+        q = q.filter(Speech.is_public == True)
+
+    if speaker:
+        q = q.filter(Speech.speaker.ilike(f"%{speaker.strip()}%"))
+    if status_filter:
+        q = q.filter(Speech.status == status_filter)
+    if is_public is not None:
+        q = q.filter(Speech.is_public == bool(is_public))
+
+    if has_analysis is True:
+        q = q.filter(text("EXISTS (SELECT 1 FROM analyses a WHERE a.speech_id = speeches.id)"))
+    elif has_analysis is False:
+        q = q.filter(text("NOT EXISTS (SELECT 1 FROM analyses a WHERE a.speech_id = speeches.id)"))
+
+    sort_col = getattr(Speech, sort_by, None) or Speech.created_at
+    q = q.order_by(sort_col.asc() if str(sort_order).lower() == "asc" else sort_col.desc())
+
+    total = q.count()
+    offset = (page - 1) * page_size
+    rows = q.offset(offset).limit(page_size).all()
+
+    analysis_map = {a.speech_id: a for a in db.query(Analysis).filter(Analysis.speech_id.in_([s.id for s in rows])).all()} if rows else {}
+    speeches = [_speech_to_dict(s, include_text=False, include_analysis_summary=True, analysis=analysis_map.get(s.id)) for s in rows]
+    total_pages = (total + page_size - 1) // page_size
+
+    return _response(True, data={"speeches": speeches, "total": total, "page": page, "page_size": page_size, "total_pages": total_pages})
+
+
+@router.get("/{speech_id}/status")
+async def get_speech_status(
+    speech_id: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = optional_current_user_dep(),
+):
     speech = db.query(Speech).filter(Speech.id == speech_id).first()
     if not speech:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Speech not found.")
+        raise HTTPException(status_code=404, detail="Speech not found")
+    if not _can_read(speech, current_user):
+        raise HTTPException(status_code=403, detail="Not permitted")
+    analysis = db.query(Analysis).filter(Analysis.speech_id == speech_id).first()
+    return _response(
+        True,
+        data={
+            "speech_id": speech_id,
+            "status": speech.status,
+            "analyzed_at": speech.analyzed_at.isoformat() if speech.analyzed_at else None,
+            "has_analysis": bool(analysis is not None),
+        },
+    )
+
+
+@router.get("/{speech_id}/media")
+async def get_speech_media(
+    speech_id: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = optional_current_user_dep(),
+):
+    speech = db.query(Speech).filter(Speech.id == speech_id).first()
+    if not speech:
+        raise HTTPException(status_code=404, detail="Speech not found")
+    if not _can_read(speech, current_user):
+        raise HTTPException(status_code=403, detail="Not permitted")
+    if not getattr(speech, "media_url", None):
+        raise HTTPException(status_code=404, detail="No media file available")
+    return _response(True, data={"media_url": speech.media_url})
+
+
+@router.get("/{speech_id}/analysis")
+async def get_analysis(
+    speech_id: int,
+    media_duration_seconds: Optional[float] = Query(None, ge=0.0),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = optional_current_user_dep(),
+):
+    speech = db.query(Speech).filter(Speech.id == speech_id).first()
+    if not speech:
+        raise HTTPException(status_code=404, detail="Speech not found")
+    if not _can_read(speech, current_user):
+        raise HTTPException(status_code=403, detail="Not permitted")
 
     analysis = db.query(Analysis).filter(Analysis.speech_id == speech_id).first()
     if not analysis:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No analysis found for this speech.")
+        raise HTTPException(status_code=404, detail=f"Analysis not found. Speech status: {speech.status}.")
 
-    data = analysis.full_results or {}
-    if not isinstance(data, dict):
-        data = {}
+    fr = _safe_full_results(getattr(analysis, "full_results", None))
+    fr = _canonicalize_full_results(speech=speech, fr_in=fr)
 
-    data = _normalize_analysis_shape(data, speech=speech)
-
-    # NEW: Deep sanitize persisted payload prior to canonical extraction
-    data = _purge_legacy_neutral_everywhere(data)
-
-    # Extract normalized fields (with evidence validation)
-    lib, auth, cen, conf, dom_fam, dom_sub, marpor_codes = _extract_scores_top(data)
-
-    # Ensure canonical top-level fields (Centrist-only)
-    data.update(
-        {
-            "analysis_id": analysis.id,
-            "speech_id": speech_id,
-            "ideology_family": dom_fam,
-            "ideology_subtype": dom_sub,
-            "libertarian_score": lib,
-            "authoritarian_score": auth,
-            "centrist_score": cen,
-            "confidence_score": conf,
-            "marpor_codes": marpor_codes,
-            "scores": {LIB_FAMILY: lib, AUTH_FAMILY: auth, CENTRIST_FAMILY: cen},
-        }
-    )
-
-    # Sanitize nested speech_level.scores if present (redundant but safe)
-    sl = data.get("speech_level")
-    if isinstance(sl, dict) and isinstance(sl.get("scores"), dict):
-        sl["scores"] = _sanitize_scores_dict(sl.get("scores") or {})
-
-    if media_duration_seconds is not None and float(media_duration_seconds) > 0:
-        data = _apply_media_jump_time_support(data, duration=media_duration_seconds)
-
-    return create_response(
-        success=True,
-        data=data,
-        message="Latest analysis fetched.",
-        processing_time=round(time.time() - start, 4),
-        timestamp=_now_z(),
-    )
+    merged = dict(fr)
+    merged.update({"speech_id": speech_id, "title": speech.title, "speaker": speech.speaker, "text": speech.text, "transcript_text": speech.text})
+    merged = _apply_media_jump_time_support(merged, duration=media_duration_seconds)
+    return _response(True, data=merged)
 
 
-@router.post("/speech/{speech_id}/reanalyze")
-async def reanalyze_speech(speech_id: int, req: ReanalyzeRequest, db: Session = Depends(get_db)):
-    start = time.time()
-
+@router.get("/{speech_id}/key-statements")
+async def get_key_statements(
+    speech_id: int,
+    media_duration_seconds: Optional[float] = Query(None, ge=0.0),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = optional_current_user_dep(),
+):
     speech = db.query(Speech).filter(Speech.id == speech_id).first()
     if not speech:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Speech not found.")
+        raise HTTPException(status_code=404, detail="Speech not found")
+    if not _can_read(speech, current_user):
+        raise HTTPException(status_code=403, detail="Not permitted")
 
-    text = (speech.text or "").strip()
-    if not text:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Speech has no text to analyze.")
+    analysis = db.query(Analysis).filter(Analysis.speech_id == speech_id).first()
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
 
-    title = (speech.title or "Untitled Speech").strip()
-    spk = (speech.speaker or "Unknown").strip() or "Unknown"
-    provider, model = _get_speech_llm_provider_model(speech, req.llm_provider, req.llm_model)
+    fr = _safe_full_results(getattr(analysis, "full_results", None))
+    fr = _canonicalize_full_results(speech=speech, fr_in=fr)
 
-    try:
-        if hasattr(speech, "status"):
-            speech.status = "processing"
-        db.commit()
-    except Exception:
-        db.rollback()
-
-    try:
-        merged = await _run_full_analysis(
-            text=text,
-            title=title,
-            speaker=spk,
-            use_semantic=req.use_semantic,
-            threshold=req.threshold,
-            include_questions=req.include_questions,
-            question_types=req.question_types,
-            llm_provider=provider,
-            llm_model=model,
-            max_questions=req.max_questions,
-            media_duration_seconds=req.media_duration_seconds,
-        )
-    except HTTPException:
-        try:
-            if hasattr(speech, "status"):
-                speech.status = "failed"
-            db.commit()
-        except Exception:
-            db.rollback()
-        raise
-    except Exception as e:
-        logger.error("Reanalysis pipeline failed: %s", e, exc_info=True)
-        try:
-            if hasattr(speech, "status"):
-                speech.status = "failed"
-            db.commit()
-        except Exception:
-            db.rollback()
-        raise HTTPException(status_code=500, detail="Reanalysis pipeline failed.")
-
-    try:
-        analysis = _persist_analysis_upsert(db, speech_id=speech.id, merged=merged)
-
-        if hasattr(speech, "status"):
-            speech.status = "completed"
-        if hasattr(speech, "analyzed_at"):
-            speech.analyzed_at = datetime.utcnow()
-
-        db.commit()
-        db.refresh(analysis)
-
-        merged["analysis_id"] = analysis.id
-        merged["speech_id"] = speech.id
-        merged["analysis_persisted"] = True
-    except Exception as e:
-        db.rollback()
-        logger.error("Failed to persist reanalysis: %s", e, exc_info=True)
-        merged["analysis_persisted"] = False
-        merged["analysis_persist_error"] = "Failed to persist analysis to database."
-        merged["speech_id"] = speech.id
-
-    return create_response(
-        success=True,
-        data=merged,
-        message="Reanalysis completed.",
-        processing_time=round(time.time() - start, 4),
-        timestamp=_now_z(),
-    )
+    payload = {"text": speech.text, "transcript_text": speech.text, "key_statements": fr.get("key_statements") or []}
+    payload = _apply_media_jump_time_support(payload, duration=media_duration_seconds)
+    out_ks = payload.get("key_statements") if isinstance(payload.get("key_statements"), list) else []
+    return _response(True, data={"key_statements": out_ks, "count": len(out_ks)})
 
 
-@router.post("/questions/generate")
-async def generate_questions(req: GenerateQuestionsRequest, db: Session = Depends(get_db)):
-    start = time.time()
+@router.get("/{speech_id}/sections")
+async def get_sections(
+    speech_id: int,
+    media_duration_seconds: Optional[float] = Query(None, ge=0.0),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = optional_current_user_dep(),
+):
+    speech = db.query(Speech).filter(Speech.id == speech_id).first()
+    if not speech:
+        raise HTTPException(status_code=404, detail="Speech not found")
+    if not _can_read(speech, current_user):
+        raise HTTPException(status_code=403, detail="Not permitted")
 
+    analysis = db.query(Analysis).filter(Analysis.speech_id == speech_id).first()
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+
+    fr = _safe_full_results(getattr(analysis, "full_results", None))
+    fr = _canonicalize_full_results(speech=speech, fr_in=fr)
+
+    sections = fr.get("statements") if isinstance(fr.get("statements"), list) else []
+    payload = {"text": speech.text, "transcript_text": speech.text, "sections": sections, "segments": sections, "statements": sections}
+    payload = _apply_media_jump_time_support(payload, duration=media_duration_seconds)
+    out_sections = payload.get("sections") if isinstance(payload.get("sections"), list) else sections
+    return _response(True, data={"sections": out_sections, "count": len(out_sections)})
+
+
+@router.get("/{speech_id}")
+async def get_speech(
+    speech_id: int,
+    include_text: bool = Query(True),
+    include_analysis: bool = Query(True),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = optional_current_user_dep(),
+):
+    speech = db.query(Speech).filter(Speech.id == speech_id).first()
+    if not speech:
+        raise HTTPException(status_code=404, detail="Speech not found")
+    if not _can_read(speech, current_user):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    analysis = db.query(Analysis).filter(Analysis.speech_id == speech_id).first() if include_analysis else None
+    return _response(True, data=_speech_to_dict(speech, include_text=include_text, include_analysis_summary=include_analysis, analysis=analysis))
+
+
+@router.get("/{speech_id}/full")
+async def get_speech_full(
+    speech_id: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = optional_current_user_dep(),
+):
+    speech = db.query(Speech).filter(Speech.id == speech_id).first()
+    if not speech:
+        raise HTTPException(status_code=404, detail="Speech not found")
+    if not _can_read(speech, current_user):
+        raise HTTPException(status_code=403, detail="Not permitted")
+
+    analysis = db.query(Analysis).filter(Analysis.speech_id == speech_id).first()
+    data = _speech_to_dict(speech, include_text=True, include_analysis_summary=True, analysis=analysis)
+
+    if analysis:
+        fr = _safe_full_results(getattr(analysis, "full_results", None))
+        fr = _canonicalize_full_results(speech=speech, fr_in=fr)
+        data["analysis"] = fr
+
+    qs = db.query(Question).filter(Question.speech_id == speech_id).order_by(Question.question_order.asc()).all()
+    data["questions"] = [
+        {
+            "id": q.id,
+            "question_text": q.question_text,
+            "question_type": q.question_type,
+            "order": q.question_order,
+            "created_at": q.created_at.isoformat() if q.created_at else None,
+        }
+        for q in qs
+    ]
+    return _response(True, data=data)
+
+
+@router.post("/{speech_id}/questions/generate")
+async def generate_questions_for_speech(
+    speech_id: int,
+    body: GenerateQuestionsBody,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = optional_current_user_dep(),
+):
+    """
+    Legacy compatibility endpoint used by frontend fallback:
+      POST /api/speeches/{speech_id}/questions/generate
+    """
     if not _QUESTION_GENERATOR_AVAILABLE or question_generator is None:
         raise HTTPException(status_code=503, detail="Question generation service is not available.")
 
-    speech = db.query(Speech).filter(Speech.id == req.speech_id).first()
+    speech = db.query(Speech).filter(Speech.id == speech_id).first()
     if not speech:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Speech not found.")
+        raise HTTPException(status_code=404, detail="Speech not found")
+    if not _can_read(speech, current_user):
+        raise HTTPException(status_code=403, detail="Not permitted")
 
-    provider = (req.llm_provider or getattr(speech, "llm_provider", None) or "openai").strip()
-    model = (req.llm_model or getattr(speech, "llm_model", None) or "gpt-4o-mini").strip()
+    provider = (body.llm_provider or getattr(speech, "llm_provider", None) or "openai").strip() or "openai"
+    model = (body.llm_model or getattr(speech, "llm_model", None) or "gpt-4o-mini").strip() or "gpt-4o-mini"
 
-    qt = (req.question_type or "journalistic").strip().lower()
+    qt = (body.question_type or "journalistic").strip().lower()
     if qt not in ("journalistic", "technical"):
         qt = "journalistic"
 
-    ideology_result: Dict[str, Any] = {}
-    key_segments: List[Dict[str, Any]] = []
+    latest = db.query(Analysis).filter(Analysis.speech_id == speech_id).first()
+    if not latest:
+        raise HTTPException(status_code=404, detail="No analysis found for this speech.")
 
-    try:
-        latest = db.query(Analysis).filter(Analysis.speech_id == speech.id).first()
-        if latest and isinstance(latest.full_results, dict):
-            fr = latest.full_results or {}
-            ideology_result = fr.get("speech_level") or {}
-            ks = fr.get("key_statements") or fr.get("key_segments") or fr.get("highlights") or []
-            if isinstance(ks, list):
-                key_segments = [x for x in ks if isinstance(x, dict)]
-    except Exception:
-        ideology_result = {}
-        key_segments = []
+    fr = _safe_full_results(getattr(latest, "full_results", None))
+    fr = _canonicalize_full_results(speech=speech, fr_in=fr)
+
+    summary = fr.get("analysis_summary") if isinstance(fr.get("analysis_summary"), dict) else _ensure_summary_aliases({})
+    ideology_result = {
+        "ideology_family": "Evidence-labeled",
+        "ideology_subtype": None,
+        "confidence_score": _as_float(summary.get("avg_confidence_score"), 0.0),
+        "marpor_codes": summary.get("marpor_codes") if isinstance(summary.get("marpor_codes"), list) else [],
+        "scores": {LIB_FAMILY: 0.0, AUTH_FAMILY: 0.0, ECON_LEFT: 0.0, ECON_RIGHT: 0.0, CENTRIST_FAMILY: 0.0},
+        "ideology_2d": fr.get("ideology_2d") or _extract_ideology_2d_anywhere(fr),
+    }
+
+    ks = fr.get("key_statements") if isinstance(fr.get("key_statements"), list) else []
+    key_segments = [
+        {
+            "text": str(x.get("text") or x.get("full_text") or ""),
+            "ideology_family": x.get("ideology_family"),
+            "ideology_subtype": x.get("ideology_subtype"),
+            "marpor_codes": x.get("marpor_codes") if isinstance(x.get("marpor_codes"), list) else [],
+        }
+        for x in ks[:6]
+        if isinstance(x, dict)
+    ]
 
     try:
         questions = await question_generator.generate_questions_with_llm(
             question_type=qt,
             speech_title=speech.title or "",
             speaker=speech.speaker or "",
-            ideology_result=ideology_result or {},
-            key_segments=key_segments or [],
+            ideology_result=ideology_result,
+            key_segments=key_segments,
             llm_provider=provider,
             llm_model=model,
-            max_questions=int(req.max_questions),
+            max_questions=int(body.max_questions),
         )
-        if not isinstance(questions, list):
-            questions = []
-        questions = [str(q).strip() for q in questions if str(q).strip()]
+        questions = [str(q).strip() for q in (questions if isinstance(questions, list) else []) if str(q).strip()]
     except Exception as e:
         logger.error("Questions generation failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail="Question generation failed.")
 
-    return create_response(
-        success=True,
-        data={"speech_id": req.speech_id, "question_type": qt, "questions": questions},
-        message="Questions generated.",
-        processing_time=round(time.time() - start, 4),
-        timestamp=_now_z(),
+    return _response(True, data={"speech_id": speech_id, "question_type": qt, "questions": questions}, message="Questions generated.")
+
+
+@router.put("/{speech_id}")
+async def update_speech(
+    speech_id: int,
+    payload: SpeechUpdate,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = optional_current_user_dep(),
+):
+    _require_auth_if_enabled(current_user)
+
+    speech = db.query(Speech).filter(Speech.id == speech_id).first()
+    if not speech:
+        raise HTTPException(status_code=404, detail="Speech not found")
+    _require_write_access(speech, current_user)
+
+    update = payload.model_dump(exclude_unset=True)
+    text_changed = False
+
+    if "date" in update:
+        update["date"] = _parse_iso_date(update.get("date"))
+
+    if "text" in update and update["text"] is not None:
+        new_text = _clean_text(update["text"])
+        if new_text != (speech.text or ""):
+            text_changed = True
+            speech.word_count = _word_count(new_text)
+        update["text"] = new_text
+
+    for k, v in update.items():
+        setattr(speech, k, v)
+
+    if text_changed:
+        speech.status = "pending"
+        speech.analyzed_at = None
+
+    speech.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(speech)
+
+    analysis = db.query(Analysis).filter(Analysis.speech_id == speech_id).first()
+    return _response(
+        True,
+        data=_speech_to_dict(speech, include_text=False, include_analysis_summary=True, analysis=analysis),
+        message="Speech updated." + (" Analysis marked pending due to text change." if text_changed else ""),
     )
 
 
-@router.get("/health")
-def analysis_healthcheck():
-    return create_response(
-        success=True,
-        data={"service": "analysis", "status": "ok"},
-        message="OK",
-        processing_time=0.0,
-        timestamp=_now_z(),
-    )
+@router.delete("/{speech_id}")
+async def delete_speech(
+    speech_id: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = optional_current_user_dep(),
+):
+    _require_auth_if_enabled(current_user)
+
+    speech = db.query(Speech).filter(Speech.id == speech_id).first()
+    if not speech:
+        raise HTTPException(status_code=404, detail="Speech not found")
+    _require_write_access(speech, current_user)
+
+    media_url = getattr(speech, "media_url", None)
+    if isinstance(media_url, str) and media_url.startswith("/media/uploads/"):
+        filename = media_url.split("/media/uploads/")[-1]
+        p = UPLOAD_DIR / filename
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+    db.query(Analysis).filter(Analysis.speech_id == speech_id).delete()
+    db.query(Question).filter(Question.speech_id == speech_id).delete()
+    db.delete(speech)
+    db.commit()
+
+    return _response(True, message="Speech deleted.")
+
+
+@router.post("/{speech_id}/analyze")
+async def analyze_existing_speech(
+    speech_id: int,
+    background_tasks: BackgroundTasks,
+    force: bool = Query(False),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = optional_current_user_dep(),
+):
+    _require_auth_if_enabled(current_user)
+    if not _INGEST_AVAILABLE or ingest_speech is None:
+        raise HTTPException(status_code=503, detail="Analysis service not available")
+
+    speech = db.query(Speech).filter(Speech.id == speech_id).first()
+    if not speech:
+        raise HTTPException(status_code=404, detail="Speech not found")
+    _require_write_access(speech, current_user)
+
+    analysis = db.query(Analysis).filter(Analysis.speech_id == speech_id).first()
+    if speech.status == "processing":
+        return _response(True, data={"speech_id": speech_id, "status": "processing"}, message="Analysis already running.")
+    if speech.status == "completed" and analysis is not None and not force:
+        return _response(
+            True,
+            data=_speech_to_dict(speech, include_text=False, include_analysis_summary=True, analysis=analysis),
+            message="Analysis already exists. Use force=true to re-run.",
+        )
+
+    speech.status = "pending"
+    db.commit()
+
+    background_tasks.add_task(_run_analysis_and_persist, speech_id)
+    return _response(True, data={"speech_id": speech_id, "status": "queued"}, message="Analysis queued.")
 
 
 __all__ = ["router"]

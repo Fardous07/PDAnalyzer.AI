@@ -1,347 +1,405 @@
-"""
-Transcription service using OpenAI Whisper API
-Handles audio and video file transcription
-"""
-import os
+# backend/app/services/transcription.py
+
+from __future__ import annotations
+
 import logging
-from pathlib import Path
-from typing import Optional, Dict, Any
-import openai
-from pydub import AudioSegment
+import os
 import tempfile
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from pydub import AudioSegment
 
 logger = logging.getLogger(__name__)
 
-# Supported audio formats
-AUDIO_FORMATS = {'.mp3', '.mp4', '.mpeg', '.mpga', '.m4a', '.wav', '.webm'}
+AUDIO_FORMATS: Set[str] = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm"}
+VIDEO_FORMATS: Set[str] = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv"}
 
-# Supported video formats (will extract audio)
-VIDEO_FORMATS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.flv', '.wmv'}
+MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024
 
-# OpenAI Whisper file size limit (25 MB)
-MAX_FILE_SIZE = 25 * 1024 * 1024
+DEFAULT_CHUNK_DURATION_MS = 10 * 60 * 1000
+DEFAULT_EXPORT_FORMAT = "mp3"
+DEFAULT_EXPORT_BITRATE = os.getenv("TRANSCRIPTION_MP3_BITRATE", "96k")
+
+
+def _safe_unlink(path: str) -> None:
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def _is_ext(path: str, exts: Set[str]) -> bool:
+    return Path(path).suffix.lower() in exts
+
+
+def _segment_to_dict(seg: Any, *, offset_seconds: float = 0.0) -> Dict[str, Any]:
+    if isinstance(seg, dict):
+        start = float(seg.get("start", 0.0) or 0.0) + float(offset_seconds)
+        end = float(seg.get("end", 0.0) or 0.0) + float(offset_seconds)
+        text = str(seg.get("text", "") or "")
+        return {"start": start, "end": end, "text": text}
+
+    start = float(getattr(seg, "start", 0.0) or 0.0) + float(offset_seconds)
+    end = float(getattr(seg, "end", 0.0) or 0.0) + float(offset_seconds)
+    text = str(getattr(seg, "text", "") or "")
+    return {"start": start, "end": end, "text": text}
+
+
+def _word_to_dict(w: Any, *, offset_seconds: float = 0.0) -> Dict[str, Any]:
+    if isinstance(w, dict):
+        start = float(w.get("start", 0.0) or 0.0) + float(offset_seconds)
+        end = float(w.get("end", 0.0) or 0.0) + float(offset_seconds)
+        word = str(w.get("word", "") or "")
+        return {"start": start, "end": end, "word": word}
+
+    start = float(getattr(w, "start", 0.0) or 0.0) + float(offset_seconds)
+    end = float(getattr(w, "end", 0.0) or 0.0) + float(offset_seconds)
+    word = str(getattr(w, "word", "") or "")
+    return {"start": start, "end": end, "word": word}
 
 
 class TranscriptionService:
-    """Service for transcribing audio/video files using OpenAI Whisper"""
-    
-    def __init__(self, api_key: Optional[str] = None):
-        """
-        Initialize transcription service
-        
-        Args:
-            api_key: OpenAI API key. If None, reads from environment
-        """
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None) -> None:
+        self.api_key = (api_key or os.getenv("OPENAI_API_KEY") or "").strip()
+        self.model = (model or os.getenv("TRANSCRIPTION_MODEL") or "whisper-1").strip()
+
         if not self.api_key:
-            logger.warning("OpenAI API key not configured. Transcription will not be available.")
-        else:
-            openai.api_key = self.api_key
-            logger.info("Transcription service initialized with OpenAI Whisper")
-    
+            logger.warning("OPENAI_API_KEY not configured. Transcription is unavailable.")
+            self.client = None
+            return
+
+        try:
+            from openai import OpenAI  # type: ignore
+        except Exception as e:
+            logger.error("openai package not installed or incompatible: %s", e)
+            self.client = None
+            return
+
+        self.client = OpenAI(api_key=self.api_key)
+        logger.info("TranscriptionService initialized with model=%s", self.model)
+
     def is_audio_file(self, file_path: str) -> bool:
-        """Check if file is an audio format"""
-        ext = Path(file_path).suffix.lower()
-        return ext in AUDIO_FORMATS
-    
+        return _is_ext(file_path, AUDIO_FORMATS)
+
     def is_video_file(self, file_path: str) -> bool:
-        """Check if file is a video format"""
-        ext = Path(file_path).suffix.lower()
-        return ext in VIDEO_FORMATS
-    
+        return _is_ext(file_path, VIDEO_FORMATS)
+
     def needs_transcription(self, file_path: str) -> bool:
-        """Check if file needs transcription"""
         return self.is_audio_file(file_path) or self.is_video_file(file_path)
-    
-    def extract_audio_from_video(self, video_path: str) -> str:
-        """
-        Extract audio from video file
-        
-        Args:
-            video_path: Path to video file
-            
-        Returns:
-            Path to extracted audio file (mp3)
-        """
-        logger.info(f"Extracting audio from video: {video_path}")
-        
+
+    def extract_audio_from_video(self, video_path: str, *, export_bitrate: str = DEFAULT_EXPORT_BITRATE) -> str:
+        if not video_path:
+            raise ValueError("video_path is empty")
+
+        temp_dir = tempfile.gettempdir()
+        audio_filename = f"{Path(video_path).stem}_audio_{os.getpid()}.mp3"
+        audio_path = os.path.join(temp_dir, audio_filename)
+
+        logger.info("Extracting audio from video: %s", video_path)
         try:
-            # Create temporary file for audio
-            temp_dir = tempfile.gettempdir()
-            audio_filename = f"{Path(video_path).stem}_audio.mp3"
-            audio_path = os.path.join(temp_dir, audio_filename)
-            
-            # Load video and extract audio
             video = AudioSegment.from_file(video_path)
-            
-            # Export as mp3
-            video.export(audio_path, format="mp3")
-            
-            logger.info(f"Audio extracted successfully: {audio_path}")
+            video.export(audio_path, format="mp3", bitrate=export_bitrate)
+            logger.info("Audio extracted: %s", audio_path)
             return audio_path
-            
         except Exception as e:
-            logger.error(f"Failed to extract audio from video: {e}")
-            raise Exception(f"Audio extraction failed: {str(e)}")
-    
-    def split_audio_file(self, audio_path: str, chunk_duration_ms: int = 600000) -> list[str]:
-        """
-        Split large audio file into chunks (10 minutes each by default)
-        
-        Args:
-            audio_path: Path to audio file
-            chunk_duration_ms: Chunk duration in milliseconds (default: 10 minutes)
-            
-        Returns:
-            List of paths to audio chunks
-        """
-        logger.info(f"Splitting large audio file: {audio_path}")
-        
-        try:
-            audio = AudioSegment.from_file(audio_path)
-            chunks = []
-            temp_dir = tempfile.gettempdir()
-            
-            # Split into chunks
-            for i, start_time in enumerate(range(0, len(audio), chunk_duration_ms)):
-                chunk = audio[start_time:start_time + chunk_duration_ms]
-                
-                chunk_filename = f"{Path(audio_path).stem}_chunk_{i}.mp3"
-                chunk_path = os.path.join(temp_dir, chunk_filename)
-                
-                chunk.export(chunk_path, format="mp3")
-                chunks.append(chunk_path)
-                
-                logger.info(f"Created chunk {i+1}: {chunk_path}")
-            
-            logger.info(f"Split audio into {len(chunks)} chunks")
-            return chunks
-            
-        except Exception as e:
-            logger.error(f"Failed to split audio file: {e}")
-            raise Exception(f"Audio splitting failed: {str(e)}")
-    
+            _safe_unlink(audio_path)
+            raise RuntimeError(f"Audio extraction failed: {e}") from e
+
+    def split_audio_file(
+        self,
+        audio_path: str,
+        *,
+        chunk_duration_ms: int = DEFAULT_CHUNK_DURATION_MS,
+        export_format: str = DEFAULT_EXPORT_FORMAT,
+        export_bitrate: str = DEFAULT_EXPORT_BITRATE,
+    ) -> List[Tuple[str, float]]:
+        if not audio_path:
+            raise ValueError("audio_path is empty")
+
+        audio = AudioSegment.from_file(audio_path)
+        total_ms = len(audio)
+        if total_ms <= 0:
+            raise RuntimeError("Audio appears empty or unreadable")
+
+        temp_dir = tempfile.gettempdir()
+        chunks: List[Tuple[str, float]] = []
+
+        logger.info("Splitting audio into chunks: %s", audio_path)
+
+        i = 0
+        for start_ms in range(0, total_ms, int(chunk_duration_ms)):
+            end_ms = min(total_ms, start_ms + int(chunk_duration_ms))
+            chunk = audio[start_ms:end_ms]
+
+            chunk_filename = f"{Path(audio_path).stem}_chunk_{i}_{os.getpid()}.{export_format}"
+            chunk_path = os.path.join(temp_dir, chunk_filename)
+
+            chunk.export(chunk_path, format=export_format, bitrate=export_bitrate)
+
+            if os.path.getsize(chunk_path) > MAX_FILE_SIZE_BYTES:
+                _safe_unlink(chunk_path)
+                half = max(30_000, int((end_ms - start_ms) / 2))
+                if half >= (end_ms - start_ms):
+                    raise RuntimeError("Chunking failed to reduce size below limit.")
+
+                sub_audio = audio[start_ms:end_ms]
+                sub_temp_path = os.path.join(temp_dir, f"{Path(audio_path).stem}_sub_{i}_{os.getpid()}.wav")
+                sub_audio.export(sub_temp_path, format="wav")
+                try:
+                    sub_chunks = self.split_audio_file(
+                        sub_temp_path,
+                        chunk_duration_ms=half,
+                        export_format=export_format,
+                        export_bitrate=export_bitrate,
+                    )
+                    for p, off in sub_chunks:
+                        chunks.append((p, (start_ms / 1000.0) + off))
+                finally:
+                    _safe_unlink(sub_temp_path)
+            else:
+                chunks.append((chunk_path, start_ms / 1000.0))
+
+            i += 1
+
+        logger.info("Created %d chunk(s)", len(chunks))
+        return chunks
+
+    def _require_client(self) -> None:
+        if self.client is None:
+            raise RuntimeError("OpenAI client not initialized. Check OPENAI_API_KEY and openai package.")
+
+    def _transcribe_one(
+        self,
+        file_path: str,
+        *,
+        language: Optional[str],
+        prompt: Optional[str],
+        with_timestamps: bool,
+        word_timestamps: bool,
+    ) -> Dict[str, Any]:
+        self._require_client()
+
+        timestamp_granularities: List[str] = []
+        response_format = "json"
+
+        if with_timestamps:
+            response_format = "verbose_json"
+            timestamp_granularities.append("segment")
+            if word_timestamps:
+                timestamp_granularities.append("word")
+
+        with open(file_path, "rb") as f:
+            kwargs: Dict[str, Any] = {
+                "model": self.model,
+                "file": f,
+                "response_format": response_format,
+            }
+            if language:
+                kwargs["language"] = language
+            if prompt:
+                kwargs["prompt"] = prompt
+            if timestamp_granularities:
+                kwargs["timestamp_granularities"] = timestamp_granularities
+
+            resp = self.client.audio.transcriptions.create(**kwargs)
+
+        if isinstance(resp, dict):
+            text_out = str(resp.get("text", "") or "").strip()
+            segs = resp.get("segments", None)
+            wrds = resp.get("words", None)
+            duration = resp.get("duration", None)
+            lang = resp.get("language", None)
+        else:
+            text_out = (getattr(resp, "text", None) or "").strip()
+            segs = getattr(resp, "segments", None)
+            wrds = getattr(resp, "words", None)
+            duration = getattr(resp, "duration", None)
+            lang = getattr(resp, "language", None)
+
+        segments_out: List[Dict[str, Any]] = []
+        words_out: List[Dict[str, Any]] = []
+
+        if with_timestamps and segs:
+            for s in segs:
+                segments_out.append(_segment_to_dict(s, offset_seconds=0.0))
+
+        if with_timestamps and word_timestamps and wrds:
+            for w in wrds:
+                words_out.append(_word_to_dict(w, offset_seconds=0.0))
+
+        return {
+            "text": text_out,
+            "duration": float(duration) if isinstance(duration, (int, float)) else None,
+            "language": str(lang) if lang else (language or None),
+            "segments": segments_out,
+            "words": words_out,
+        }
+
     def transcribe_file(
         self,
         file_path: str,
+        *,
         language: Optional[str] = None,
-        prompt: Optional[str] = None
+        prompt: Optional[str] = None,
+        with_timestamps: bool = False,
+        word_timestamps: bool = False,
+        export_bitrate: str = DEFAULT_EXPORT_BITRATE,
     ) -> Dict[str, Any]:
-        """
-        Transcribe audio or video file using OpenAI Whisper
-        
-        Args:
-            file_path: Path to audio/video file
-            language: Optional language code (e.g., 'en', 'es')
-            prompt: Optional prompt to guide transcription
-            
-        Returns:
-            Dictionary with 'text' and 'metadata'
-        """
-        if not self.api_key:
-            raise Exception("OpenAI API key not configured. Cannot transcribe.")
-        
-        logger.info(f"Starting transcription for: {file_path}")
-        
+        self._require_client()
+
+        if not file_path or not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        original_path = file_path
+        temp_audio_path: Optional[str] = None
+
         try:
-            # Check if it's a video - extract audio first
             if self.is_video_file(file_path):
-                logger.info("Video file detected, extracting audio...")
-                audio_path = self.extract_audio_from_video(file_path)
-                original_file = file_path
+                temp_audio_path = self.extract_audio_from_video(file_path, export_bitrate=export_bitrate)
+                audio_path = temp_audio_path
+                source_type = "video"
             else:
                 audio_path = file_path
-                original_file = file_path
-            
-            # Check file size
-            file_size = os.path.getsize(audio_path)
-            logger.info(f"Audio file size: {file_size / (1024*1024):.2f} MB")
-            
-            # If file is too large, split it
-            if file_size > MAX_FILE_SIZE:
-                logger.warning(f"File exceeds {MAX_FILE_SIZE / (1024*1024)} MB limit, splitting...")
-                chunks = self.split_audio_file(audio_path)
-                
-                # Transcribe each chunk
-                full_transcript = []
-                for i, chunk_path in enumerate(chunks):
-                    logger.info(f"Transcribing chunk {i+1}/{len(chunks)}")
-                    
-                    with open(chunk_path, "rb") as audio_file:
-                        response = openai.audio.transcriptions.create(
-                            model="whisper-1",
-                            file=audio_file,
-                            language=language,
-                            prompt=prompt,
-                            response_format="verbose_json"
-                        )
-                    
-                    full_transcript.append(response.text)
-                    
-                    # Clean up chunk
-                    try:
-                        os.remove(chunk_path)
-                    except:
-                        pass
-                
-                transcript_text = " ".join(full_transcript)
-                
-                # Create metadata
-                metadata = {
-                    "duration": None,
-                    "language": response.language if hasattr(response, 'language') else language,
-                    "chunks": len(chunks)
+                source_type = "audio"
+
+            size_bytes = os.path.getsize(audio_path)
+            logger.info(
+                "Transcription input=%s size=%.2fMB model=%s",
+                audio_path,
+                size_bytes / (1024 * 1024),
+                self.model,
+            )
+
+            if size_bytes <= MAX_FILE_SIZE_BYTES:
+                one = self._transcribe_one(
+                    audio_path,
+                    language=language,
+                    prompt=prompt,
+                    with_timestamps=with_timestamps,
+                    word_timestamps=word_timestamps,
+                )
+                return {
+                    "text": one["text"],
+                    "segments": one.get("segments", []) if with_timestamps else [],
+                    "words": one.get("words", []) if (with_timestamps and word_timestamps) else [],
+                    "metadata": {
+                        "model": self.model,
+                        "source_type": source_type,
+                        "original_file": str(original_path),
+                        "audio_file_used": str(audio_path),
+                        "file_size_bytes": int(size_bytes),
+                        "chunks": 1,
+                        "duration": one.get("duration"),
+                        "language": one.get("language"),
+                        "with_timestamps": bool(with_timestamps),
+                        "word_timestamps": bool(word_timestamps),
+                    },
                 }
-            else:
-                # Transcribe single file
-                with open(audio_path, "rb") as audio_file:
-                    response = openai.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=audio_file,
-                        language=language,
-                        prompt=prompt,
-                        response_format="verbose_json"
-                    )
-                
-                transcript_text = response.text
-                
-                # Create metadata
-                metadata = {
-                    "duration": getattr(response, 'duration', None),
-                    "language": getattr(response, 'language', language),
-                    "chunks": 1
-                }
-            
-            # Clean up extracted audio if it was from video
-            if self.is_video_file(original_file) and audio_path != original_file:
-                try:
-                    os.remove(audio_path)
-                except:
-                    pass
-            
-            logger.info(f"Transcription completed. Text length: {len(transcript_text)} chars")
-            
+
+            chunks = self.split_audio_file(audio_path, export_bitrate=export_bitrate)
+            all_text: List[str] = []
+            all_segments: List[Dict[str, Any]] = []
+            all_words: List[Dict[str, Any]] = []
+
+            final_language: Optional[str] = None
+
+            for chunk_path, offset_s in chunks:
+                one = self._transcribe_one(
+                    chunk_path,
+                    language=language,
+                    prompt=prompt,
+                    with_timestamps=with_timestamps,
+                    word_timestamps=word_timestamps,
+                )
+                if one.get("text"):
+                    all_text.append(str(one["text"]))
+
+                if with_timestamps:
+                    for s in one.get("segments", []) or []:
+                        all_segments.append(_segment_to_dict(s, offset_seconds=offset_s))
+                    if word_timestamps:
+                        for w in one.get("words", []) or []:
+                            all_words.append(_word_to_dict(w, offset_seconds=offset_s))
+
+                if not final_language and one.get("language"):
+                    final_language = str(one["language"])
+
+                _safe_unlink(chunk_path)
+
+            stitched_text = " ".join(t.strip() for t in all_text if t and t.strip()).strip()
+            final_duration = float(max((s.get("end", 0.0) or 0.0) for s in all_segments)) if (with_timestamps and all_segments) else None
+
             return {
-                "text": transcript_text,
-                "metadata": metadata
+                "text": stitched_text,
+                "segments": all_segments if with_timestamps else [],
+                "words": all_words if (with_timestamps and word_timestamps) else [],
+                "metadata": {
+                    "model": self.model,
+                    "source_type": source_type,
+                    "original_file": str(original_path),
+                    "audio_file_used": str(audio_path),
+                    "file_size_bytes": int(size_bytes),
+                    "chunks": int(len(chunks)),
+                    "duration": final_duration,
+                    "language": final_language or language,
+                    "with_timestamps": bool(with_timestamps),
+                    "word_timestamps": bool(word_timestamps),
+                },
             }
-            
-        except openai.APIError as e:
-            logger.error(f"OpenAI API error during transcription: {e}")
-            raise Exception(f"Transcription failed: {str(e)}")
-        except Exception as e:
-            logger.error(f"Transcription error: {e}")
-            raise Exception(f"Transcription failed: {str(e)}")
-    
+
+        finally:
+            if temp_audio_path and temp_audio_path != original_path:
+                _safe_unlink(temp_audio_path)
+
     def transcribe_with_timestamps(
         self,
         file_path: str,
-        language: Optional[str] = None
+        *,
+        language: Optional[str] = None,
+        prompt: Optional[str] = None,
+        word_timestamps: bool = False,
     ) -> Dict[str, Any]:
-        """
-        Transcribe with word-level timestamps (if needed for advanced features)
-        
-        Args:
-            file_path: Path to audio/video file
-            language: Optional language code
-            
-        Returns:
-            Dictionary with 'text', 'segments', and 'metadata'
-        """
-        if not self.api_key:
-            raise Exception("OpenAI API key not configured. Cannot transcribe.")
-        
-        logger.info(f"Starting transcription with timestamps: {file_path}")
-        
-        try:
-            # Handle video files
-            if self.is_video_file(file_path):
-                audio_path = self.extract_audio_from_video(file_path)
-            else:
-                audio_path = file_path
-            
-            # Check file size - timestamps only work with single file
-            file_size = os.path.getsize(audio_path)
-            if file_size > MAX_FILE_SIZE:
-                logger.warning("File too large for timestamp transcription, using regular transcription")
-                return self.transcribe_file(file_path, language)
-            
-            # Transcribe with timestamps
-            with open(audio_path, "rb") as audio_file:
-                response = openai.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file,
-                    language=language,
-                    response_format="verbose_json",
-                    timestamp_granularities=["segment"]
-                )
-            
-            # Extract segments with timestamps
-            segments = []
-            if hasattr(response, 'segments'):
-                for segment in response.segments:
-                    segments.append({
-                        "start": segment.get('start'),
-                        "end": segment.get('end'),
-                        "text": segment.get('text', '')
-                    })
-            
-            # Clean up extracted audio if needed
-            if self.is_video_file(file_path) and audio_path != file_path:
-                try:
-                    os.remove(audio_path)
-                except:
-                    pass
-            
-            return {
-                "text": response.text,
-                "segments": segments,
-                "metadata": {
-                    "duration": getattr(response, 'duration', None),
-                    "language": getattr(response, 'language', language)
-                }
-            }
-            
-        except Exception as e:
-            logger.error(f"Timestamp transcription error: {e}")
-            # Fallback to regular transcription
-            return self.transcribe_file(file_path, language)
+        return self.transcribe_file(
+            file_path,
+            language=language,
+            prompt=prompt,
+            with_timestamps=True,
+            word_timestamps=word_timestamps,
+        )
 
 
-# Singleton instance
 _transcription_service: Optional[TranscriptionService] = None
 
 
 def get_transcription_service() -> TranscriptionService:
-    """Get or create transcription service singleton"""
     global _transcription_service
-    
     if _transcription_service is None:
         _transcription_service = TranscriptionService()
-    
     return _transcription_service
 
 
 def transcribe_media_file(
     file_path: str,
+    *,
     language: Optional[str] = None,
-    with_timestamps: bool = False
+    with_timestamps: bool = False,
+    word_timestamps: bool = False,
+    prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Convenience function to transcribe a media file
-    
-    Args:
-        file_path: Path to audio/video file
-        language: Optional language code
-        with_timestamps: Whether to include timestamps
-        
-    Returns:
-        Dictionary with transcription results
-    """
-    service = get_transcription_service()
-    
-    if with_timestamps:
-        return service.transcribe_with_timestamps(file_path, language)
-    else:
-        return service.transcribe_file(file_path, language)
+    svc = get_transcription_service()
+    return svc.transcribe_file(
+        file_path,
+        language=language,
+        prompt=prompt,
+        with_timestamps=with_timestamps,
+        word_timestamps=word_timestamps,
+    )
+
+
+__all__ = [
+    "TranscriptionService",
+    "get_transcription_service",
+    "transcribe_media_file",
+]

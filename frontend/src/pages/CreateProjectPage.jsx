@@ -23,7 +23,8 @@ const CreateProjectPage = ({ refreshProjects }) => {
   const { token, user, refreshProjects: refreshProjectsFromContext } = useAuth();
   const navigate = useNavigate();
 
-  const refreshFn = typeof refreshProjects === "function" ? refreshProjects : refreshProjectsFromContext;
+  const refreshFn =
+    typeof refreshProjects === "function" ? refreshProjects : refreshProjectsFromContext;
 
   const [title, setTitle] = useState("");
   const [speaker, setSpeaker] = useState("");
@@ -46,14 +47,30 @@ const CreateProjectPage = ({ refreshProjects }) => {
   const modelOptions = useMemo(
     () => ({
       openai: [
-        { value: "gpt-4o-mini", label: "GPT-4o Mini", description: "Fast, accurate, cost-effective" },
+        {
+          value: "gpt-4o-mini",
+          label: "GPT-4o Mini",
+          description: "Fast, accurate, cost-effective",
+        },
         { value: "gpt-4o", label: "GPT-4o", description: "Higher accuracy, richer reasoning" },
         { value: "gpt-4", label: "GPT-4", description: "Legacy high-precision model" },
       ],
       groq: [
-        { value: "mixtral-8x7b-32768", label: "Mixtral 8x7b", description: "High-performance open-source analysis" },
-        { value: "llama3-70b-8192", label: "Llama 3 70B", description: "Deep contextual understanding" },
-        { value: "llama3-8b-8192", label: "Llama 3 8B", description: "Fast inference for rapid analysis" },
+        {
+          value: "mixtral-8x7b-32768",
+          label: "Mixtral 8x7b",
+          description: "High-performance open-source analysis",
+        },
+        {
+          value: "llama3-70b-8192",
+          label: "Llama 3 70B",
+          description: "Deep contextual understanding",
+        },
+        {
+          value: "llama3-8b-8192",
+          label: "Llama 3 8B",
+          description: "Fast inference for rapid analysis",
+        },
       ],
     }),
     []
@@ -74,10 +91,14 @@ const CreateProjectPage = ({ refreshProjects }) => {
   const isAudioFile = (ext) => ["mp3", "wav", "m4a", "aac", "flac", "ogg"].includes(ext);
 
   const maxSize =
-    user?.max_file_size && !Number.isNaN(Number(user.max_file_size)) ? Number(user.max_file_size) : DEFAULT_MAX_SIZE;
+    user?.max_file_size && !Number.isNaN(Number(user.max_file_size))
+      ? Number(user.max_file_size)
+      : DEFAULT_MAX_SIZE;
 
   const maxSpeeches =
-    user?.max_speeches && !Number.isNaN(Number(user.max_speeches)) ? Number(user.max_speeches) : DEFAULT_MAX_SPEECHES;
+    user?.max_speeches && !Number.isNaN(Number(user.max_speeches))
+      ? Number(user.max_speeches)
+      : DEFAULT_MAX_SPEECHES;
 
   const usedCountRaw =
     (typeof user?.speech_count === "number" ? user.speech_count : null) ??
@@ -121,8 +142,8 @@ const CreateProjectPage = ({ refreshProjects }) => {
     // Informational warnings only
     if (isVideo || isAudio) {
       setError(
-        `Note: You selected a ${isVideo ? "video" : "audio"} file. `
-
+        `Note: You selected a ${isVideo ? "video" : "audio"} file. ` +
+          "The backend will transcribe it before analysis. Large files may take longer."
       );
     } else if (isDocLike(ext)) {
       setError(`Note: You selected a .${ext.toUpperCase()} file. If parsing fails, try converting it to .txt.`);
@@ -247,6 +268,7 @@ const CreateProjectPage = ({ refreshProjects }) => {
         .then(async () => {
           setCurrentStatus("Analysis complete! Redirecting...");
           setUploadProgress(100);
+          setIsProcessing(false);
 
           if (typeof refreshFn === "function") {
             try {
@@ -263,6 +285,7 @@ const CreateProjectPage = ({ refreshProjects }) => {
           setPollingError(errMsg);
           setCurrentStatus("Analysis encountered an issue.");
           setUploadProgress(100);
+          setIsProcessing(false);
         });
     } catch (err) {
       let errorMessage = extractErrorMessage(err);
@@ -292,7 +315,8 @@ const CreateProjectPage = ({ refreshProjects }) => {
 
   const getStatusIcon = () => {
     if (pollingError) return <XCircle className="w-5 h-5 text-rose-400" />;
-    if (uploadProgress === 100 && !pollingError && !isProcessing) return <CheckCircle className="w-5 h-5 text-emerald-400" />;
+    if (uploadProgress === 100 && !pollingError && !isProcessing)
+      return <CheckCircle className="w-5 h-5 text-emerald-400" />;
     if (loading || isProcessing) return <Loader2 className="w-5 h-5 text-indigo-400 animate-spin" />;
     return null;
   };
@@ -303,7 +327,9 @@ const CreateProjectPage = ({ refreshProjects }) => {
         <div className="flex items-start justify-between gap-4">
           <div>
             <h1 className="text-2xl font-bold text-white">Create Analysis</h1>
-            <p className="text-sm text-gray-400 mt-1">Upload a speech and generate ideological analysis results.</p>
+            <p className="text-sm text-gray-400 mt-1">
+              Upload a speech and generate ideological analysis results.
+            </p>
           </div>
 
           <button
@@ -328,7 +354,8 @@ const CreateProjectPage = ({ refreshProjects }) => {
             <div>
               <span>{pollingError}</span>
               <p className="text-xs mt-1 text-amber-200/80">
-                The speech was uploaded. If the server stays running, analysis may still complete. Check the dashboard.
+                The speech was uploaded. If the server stays running, analysis may still complete.
+                Check the dashboard.
               </p>
             </div>
           </div>
@@ -401,7 +428,9 @@ const CreateProjectPage = ({ refreshProjects }) => {
 
               <div className="space-y-4">
                 <div>
-                  <label className="block text-xs font-medium text-gray-300 mb-2">Speech Title *</label>
+                  <label className="block text-xs font-medium text-gray-300 mb-2">
+                    Speech Title *
+                  </label>
                   <input
                     type="text"
                     value={title}
@@ -414,7 +443,9 @@ const CreateProjectPage = ({ refreshProjects }) => {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-gray-300 mb-2">Speaker *</label>
+                  <label className="block text-xs font-medium text-gray-300 mb-2">
+                    Speaker *
+                  </label>
                   <input
                     type="text"
                     value={speaker}
@@ -427,7 +458,9 @@ const CreateProjectPage = ({ refreshProjects }) => {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-gray-300 mb-2">Topic (optional)</label>
+                  <label className="block text-xs font-medium text-gray-300 mb-2">
+                    Topic (optional)
+                  </label>
                   <input
                     type="text"
                     value={topic}
@@ -439,7 +472,9 @@ const CreateProjectPage = ({ refreshProjects }) => {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-gray-300 mb-2">Date (optional)</label>
+                  <label className="block text-xs font-medium text-gray-300 mb-2">
+                    Date (optional)
+                  </label>
                   <input
                     type="date"
                     value={date}
@@ -450,7 +485,9 @@ const CreateProjectPage = ({ refreshProjects }) => {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-gray-300 mb-2">Location (optional)</label>
+                  <label className="block text-xs font-medium text-gray-300 mb-2">
+                    Location (optional)
+                  </label>
                   <input
                     type="text"
                     value={location}
@@ -462,7 +499,9 @@ const CreateProjectPage = ({ refreshProjects }) => {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-gray-300 mb-2">Event (optional)</label>
+                  <label className="block text-xs font-medium text-gray-300 mb-2">
+                    Event (optional)
+                  </label>
                   <input
                     type="text"
                     value={event}
@@ -490,14 +529,20 @@ const CreateProjectPage = ({ refreshProjects }) => {
                         </div>
                         <div className="flex justify-between">
                           <span className="text-gray-400">Remaining:</span>
-                          <span className={`font-medium ${remainingAnalyses === 0 ? "text-rose-300" : "text-emerald-300"}`}>
+                          <span
+                            className={`font-medium ${
+                              remainingAnalyses === 0 ? "text-rose-300" : "text-emerald-300"
+                            }`}
+                          >
                             {remainingAnalyses}
                           </span>
                         </div>
                         <div className="h-1.5 bg-gray-900/60 rounded-full overflow-hidden">
                           <div
                             className="h-full bg-gradient-to-r from-emerald-500 to-teal-500 rounded-full"
-                            style={{ width: `${Math.min(((usedCount / maxSpeeches) * 100) || 0, 100)}%` }}
+                            style={{
+                              width: `${Math.min(((usedCount / maxSpeeches) * 100) || 0, 100)}%`,
+                            }}
                           />
                         </div>
                       </>
@@ -527,7 +572,9 @@ const CreateProjectPage = ({ refreshProjects }) => {
 
                 <div
                   className={`border-2 border-dashed rounded-2xl p-5 flex flex-col items-center justify-center text-center transition-colors ${
-                    file ? "border-emerald-500/40 bg-emerald-900/10" : "border-gray-700/70 bg-gray-900/30 hover:border-indigo-500/50"
+                    file
+                      ? "border-emerald-500/40 bg-emerald-900/10"
+                      : "border-gray-700/70 bg-gray-900/30 hover:border-indigo-500/50"
                   }`}
                 >
                   <div className="mb-3">{getFileIcon()}</div>
@@ -536,7 +583,8 @@ const CreateProjectPage = ({ refreshProjects }) => {
                     <>
                       <p className="text-sm font-medium text-white mb-1">{file.name}</p>
                       <p className="text-xs text-gray-400 mb-3">
-                        Size: {(file.size / (1024 * 1024)).toFixed(2)} MB • Format: {getExt(file.name).toUpperCase()}
+                        Size: {(file.size / (1024 * 1024)).toFixed(2)} MB • Format:{" "}
+                        {getExt(file.name).toUpperCase()}
                       </p>
                       <div className="flex gap-2">
                         <label className="cursor-pointer text-xs px-3 py-2 rounded-xl bg-gray-900/50 border border-gray-700/50 text-gray-200 hover:bg-gray-900/70 transition-colors">
@@ -580,7 +628,9 @@ const CreateProjectPage = ({ refreshProjects }) => {
                           disabled={loading || isProcessing}
                         />
                       </label>
-                      <p className="text-xs text-gray-400 mt-3">Max file size: {(maxSize / (1024 * 1024)).toFixed(0)} MB</p>
+                      <p className="text-xs text-gray-400 mt-3">
+                        Max file size: {(maxSize / (1024 * 1024)).toFixed(0)} MB
+                      </p>
                     </>
                   )}
                 </div>
@@ -600,7 +650,9 @@ const CreateProjectPage = ({ refreshProjects }) => {
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-xs font-medium text-gray-300 mb-2">Provider</label>
+                    <label className="block text-xs font-medium text-gray-300 mb-2">
+                      Provider
+                    </label>
                     <div className="relative">
                       <select
                         value={llmProvider}
@@ -616,7 +668,9 @@ const CreateProjectPage = ({ refreshProjects }) => {
                   </div>
 
                   <div>
-                    <label className="block text-xs font-medium text-gray-300 mb-2">Model</label>
+                    <label className="block text-xs font-medium text-gray-300 mb-2">
+                      Model
+                    </label>
                     <div className="relative">
                       <select
                         value={llmModel}
@@ -633,7 +687,8 @@ const CreateProjectPage = ({ refreshProjects }) => {
                       <ChevronDown className="absolute right-3 top-3.5 w-4 h-4 text-gray-400 pointer-events-none" />
                     </div>
                     <p className="text-xs text-gray-400 mt-1">
-                      {modelOptions[llmProvider]?.find((m) => m.value === llmModel)?.description || "Select a model"}
+                      {modelOptions[llmProvider]?.find((m) => m.value === llmModel)?.description ||
+                        "Select a model"}
                     </p>
                   </div>
                 </div>
@@ -660,7 +715,9 @@ const CreateProjectPage = ({ refreshProjects }) => {
                   ) : (
                     <>
                       <Brain className="w-5 h-5 mr-2" />
-                      {remainingAnalyses !== null && remainingAnalyses <= 0 ? "Analysis Limit Reached" : "Start Analysis"}
+                      {remainingAnalyses !== null && remainingAnalyses <= 0
+                        ? "Analysis Limit Reached"
+                        : "Start Analysis"}
                     </>
                   )}
                 </button>

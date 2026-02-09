@@ -1,5 +1,4 @@
 # backend/app/api/routes/users.py
-
 from __future__ import annotations
 
 import logging
@@ -7,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, ConfigDict
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_, and_, desc
 
@@ -21,7 +20,7 @@ except Exception:
     _AUTH_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/users", tags=["users"])
+router = APIRouter(prefix="/users", tags=["users"])
 
 
 # =============================================================================
@@ -47,27 +46,25 @@ def create_response(
 # AUTH HELPERS
 # =============================================================================
 
-async def require_current_user(
-    current_user: User = Depends(get_current_user),
-) -> User:
+async def require_current_user(current_user: User = Depends(get_current_user)) -> User:
     if not _AUTH_AVAILABLE:
         raise HTTPException(status_code=503, detail="Authentication service not available")
     return current_user
 
 
-async def require_admin_user(
-    current_user: User = Depends(get_current_admin_user),
-) -> User:
+async def require_admin_user(current_user: User = Depends(get_current_admin_user)) -> User:
     if not _AUTH_AVAILABLE:
         raise HTTPException(status_code=503, detail="Authentication service not available")
     return current_user
 
 
 # =============================================================================
-# Pydantic Models
+# Pydantic Models (v2)
 # =============================================================================
 
 class PublicUserProfile(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     username: Optional[str] = None
     full_name: Optional[str] = None
@@ -76,9 +73,6 @@ class PublicUserProfile(BaseModel):
     created_at: datetime
     speech_count: int = 0
     analysis_count: int = 0
-
-    class Config:
-        from_attributes = True
 
 
 class UserStats(BaseModel):
@@ -104,12 +98,12 @@ class UserUpdateAdmin(BaseModel):
 
 
 class BulkUpdateRequest(BaseModel):
-    user_ids: List[int] = Field(..., min_items=1, max_items=100)
+    user_ids: List[int] = Field(..., min_length=1, max_length=100)
     updates: Dict[str, Any]
 
 
 class BulkDeleteRequest(BaseModel):
-    user_ids: List[int] = Field(..., min_items=1, max_items=100)
+    user_ids: List[int] = Field(..., min_length=1, max_length=100)
     confirm: bool = Field(..., description="Must be true to confirm deletion")
 
 
@@ -184,7 +178,12 @@ async def search_users(
 
     results: List[Dict[str, Any]] = []
     for u in users:
-        public_speech_count = db.query(func.count(Speech.id)).filter(Speech.user_id == u.id, Speech.is_public == True).scalar() or 0
+        public_speech_count = (
+            db.query(func.count(Speech.id))
+            .filter(Speech.user_id == u.id, Speech.is_public == True)
+            .scalar()
+            or 0
+        )
         results.append(
             {
                 "id": u.id,
@@ -203,17 +202,8 @@ async def get_speakers(
     limit: int = Query(100, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
-    try:
-        if _AUTH_AVAILABLE:
-            from app.api.routes.auth import get_current_user
-            from fastapi import Request
-            # Try to get current user but don't require it
-            current_user = None
-        else:
-            current_user = None
-    except:
-        current_user = None
-
+    # keep behavior identical to your original code
+    current_user = None
     is_admin = bool(getattr(current_user, "is_admin", False)) if current_user is not None else False
 
     q = db.query(Speech.speaker, func.count(Speech.id).label("speech_count"))
@@ -245,14 +235,17 @@ async def system_user_stats_overview(
     recent_reg = db.query(func.count(User.id)).filter(User.created_at >= cutoff).scalar() or 0
     active_last_30 = db.query(func.count(User.id)).filter(User.last_login >= cutoff).scalar() or 0
 
-    return create_response(True, data={
-        "total_users": int(total_users),
-        "active_users": int(active_users),
-        "verified_users": int(verified_users),
-        "admin_users": int(admin_users),
-        "recent_registrations_30d": int(recent_reg),
-        "active_last_30d": int(active_last_30),
-    })
+    return create_response(
+        True,
+        data={
+            "total_users": int(total_users),
+            "active_users": int(active_users),
+            "verified_users": int(verified_users),
+            "admin_users": int(admin_users),
+            "recent_registrations_30d": int(recent_reg),
+            "active_last_30d": int(active_last_30),
+        },
+    )
 
 
 @router.get("/stats/top-contributors", response_model=Dict[str, Any])
@@ -287,15 +280,17 @@ async def top_contributors(
 # =============================================================================
 
 @router.get("/{user_id}/public", response_model=PublicUserProfile)
-async def get_public_profile(
-    user_id: int,
-    db: Session = Depends(get_db),
-):
+async def get_public_profile(user_id: int, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    speech_count = db.query(func.count(Speech.id)).filter(Speech.user_id == user_id, Speech.is_public == True).scalar() or 0
+    speech_count = (
+        db.query(func.count(Speech.id))
+        .filter(Speech.user_id == user_id, Speech.is_public == True)
+        .scalar()
+        or 0
+    )
     analysis_count = (
         db.query(func.count(Analysis.id))
         .join(Speech)
@@ -304,7 +299,7 @@ async def get_public_profile(
         or 0
     )
 
-    profile = PublicUserProfile(
+    return PublicUserProfile(
         id=user.id,
         username=user.username,
         full_name=user.full_name,
@@ -314,7 +309,6 @@ async def get_public_profile(
         speech_count=int(speech_count),
         analysis_count=int(analysis_count),
     )
-    return profile
 
 
 # =============================================================================
@@ -333,7 +327,6 @@ async def get_user_speeches(
     is_self = current_user.id == user_id
 
     q = db.query(Speech).filter(Speech.user_id == user_id)
-
     if not is_self and not is_admin:
         q = q.filter(Speech.is_public == True)
 
@@ -355,12 +348,10 @@ async def get_user_speeches(
         for s in rows
     ]
 
-    return create_response(True, data={
-        "speeches": speeches,
-        "total": int(total),
-        "page": page,
-        "page_size": page_size,
-    })
+    return create_response(
+        True,
+        data={"speeches": speeches, "total": int(total), "page": page, "page_size": page_size},
+    )
 
 
 @router.get("/{user_id}/stats", response_model=Dict[str, Any])
@@ -378,7 +369,7 @@ async def get_user_stats(
         raise HTTPException(status_code=404, detail="User not found")
 
     stats = _get_user_statistics(db, user_id)
-    return stats.dict()
+    return stats.model_dump()
 
 
 @router.get("/{user_id}/activity", response_model=Dict[str, Any])
@@ -404,25 +395,28 @@ async def get_user_activity(
 
     activity: List[Dict[str, Any]] = []
     for s in speeches:
-        activity.append({
-            "type": "speech_created",
-            "timestamp": s.created_at.isoformat() if s.created_at else None,
-            "data": {"speech_id": s.id, "title": s.title, "speaker": s.speaker},
-        })
+        activity.append(
+            {
+                "type": "speech_created",
+                "timestamp": s.created_at.isoformat() if s.created_at else None,
+                "data": {"speech_id": s.id, "title": s.title, "speaker": s.speaker},
+            }
+        )
         if s.analyzed_at and s.analyzed_at >= cutoff:
-            activity.append({
-                "type": "speech_analyzed",
-                "timestamp": s.analyzed_at.isoformat(),
-                "data": {"speech_id": s.id, "title": s.title, "ideology": s.analysis.ideology_family if s.analysis else None},
-            })
+            activity.append(
+                {
+                    "type": "speech_analyzed",
+                    "timestamp": s.analyzed_at.isoformat(),
+                    "data": {"speech_id": s.id, "title": s.title, "ideology": s.analysis.ideology_family if s.analysis else None},
+                }
+            )
 
     activity.sort(key=lambda x: (x["timestamp"] or ""), reverse=True)
 
-    return create_response(True, data={
-        "activity": activity,
-        "period_days": int(days),
-        "activity_count": len(activity),
-    })
+    return create_response(
+        True,
+        data={"activity": activity, "period_days": int(days), "activity_count": len(activity)},
+    )
 
 
 # =============================================================================
@@ -500,7 +494,7 @@ async def update_user_admin(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    update = payload.dict(exclude_unset=True)
+    update = payload.model_dump(exclude_unset=True)
 
     if "email" in update and update["email"] != user.email:
         exists = db.query(User).filter(User.email == update["email"]).first()
@@ -522,14 +516,18 @@ async def update_user_admin(
     db.commit()
     db.refresh(user)
 
-    return create_response(True, message="User updated successfully", data={
-        "id": user.id,
-        "email": user.email,
-        "username": user.username,
-        "is_active": user.is_active,
-        "is_verified": user.is_verified,
-        "is_admin": user.is_admin,
-    })
+    return create_response(
+        True,
+        message="User updated successfully",
+        data={
+            "id": user.id,
+            "email": user.email,
+            "username": user.username,
+            "is_active": user.is_active,
+            "is_verified": user.is_verified,
+            "is_admin": user.is_admin,
+        },
+    )
 
 
 @router.delete("/{user_id}", response_model=Dict[str, Any])
@@ -608,7 +606,11 @@ async def bulk_delete_users(
         db.delete(u)
 
     db.commit()
-    return create_response(True, message=f"Deleted {len(users)} users", data={"deleted_count": len(users), "deleted_emails": deleted_emails})
+    return create_response(
+        True,
+        message=f"Deleted {len(users)} users",
+        data={"deleted_count": len(users), "deleted_emails": deleted_emails},
+    )
 
 
 __all__ = ["router"]
