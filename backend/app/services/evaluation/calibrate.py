@@ -1,5 +1,3 @@
-# backend/app/services/evaluation/calibrate.py
-
 from __future__ import annotations
 
 import argparse
@@ -81,7 +79,7 @@ def expected_calibration_error(
     bins: List[List[int]] = [[] for _ in range(n_bins)]
     for i in range(n):
         p = clamp01(probs[i])
-        b = min(n_bins - 1, int(p * n_bins))  # p==1.0 -> last bin
+        b = min(n_bins - 1, int(p * n_bins))
         bins[b].append(i)
 
     ece = 0.0
@@ -265,7 +263,7 @@ class IsotonicCalibrator(Calibrator):
         self.values = [clamp01(float(v)) for v in vals]
 
         if self.breakpoints:
-            self.breakpoints[-1] = 1.0  # ensure coverage to 1.0
+            self.breakpoints[-1] = 1.0
 
     def predict(self, p_raw: float, group: Optional[str] = None) -> float:
         p_raw = clamp01(p_raw)
@@ -289,7 +287,6 @@ def fit_isotonic(confs: List[float], y: List[int]) -> IsotonicCalibrator:
     xs = [p for p, _ in pairs]
     ys = [yi for _, yi in pairs]
 
-    # PAV blocks
     sum_y: List[float] = []
     cnt: List[int] = []
     max_x: List[float] = []
@@ -327,7 +324,7 @@ class HistogramCalibrator(Calibrator):
         self.values = [clamp01(float(v)) for v in vals]
 
         if self.edges:
-            self.edges[-1] = 1.0  # ensure coverage to 1.0
+            self.edges[-1] = 1.0
 
     def predict(self, p_raw: float, group: Optional[str] = None) -> float:
         p_raw = clamp01(p_raw)
@@ -472,36 +469,44 @@ def _calibrator_from_dict(obj: Dict[str, Any]) -> Calibrator:
     raise ValueError(f"Unknown calibrator type: {t}")
 
 
-class ConfidenceCalibratorAdapter:
-    def __init__(self, base: Calibrator):
-        self.base = base
+# IMPORTANT: The default calibrator should be identity (no distortion) unless a trained
+# calibrator is explicitly loaded from file. Using Platt(feature='logit', a=1, b=0)
+# yields sigmoid(logit(p)) == p.
 
-    def calibrate(self, p_raw: float, group: Optional[str] = None) -> float:
-        return float(self.base.predict(clamp01(p_raw), group=group))
-
-
-class IdeologyScoringCalibrator:
-    """
-    Adapter to satisfy app.services.ideology_scoring.configure_calibrator()
-    which expects:
-      - calibrate_overall(p)
-      - calibrate_axis(p, axis)
-    """
-
-    def __init__(self, adapter: ConfidenceCalibratorAdapter):
-        self.adapter = adapter
+class ConfidenceCalibrator:
+    def __init__(self, calibrator: Optional[Calibrator] = None):
+        if calibrator is None:
+            self.calibrator = PlattCalibrator(1.0, 0.0, "logit")
+        else:
+            self.calibrator = calibrator
 
     def calibrate_overall(self, raw_confidence: float) -> float:
-        return float(self.adapter.calibrate(raw_confidence, group=None))
+        return float(self.calibrator.predict(clamp01(raw_confidence), group=None))
 
     def calibrate_axis(self, raw_confidence: float, axis: str) -> float:
-        return float(self.adapter.calibrate(raw_confidence, group=f"axis:{axis}"))
+        group = f"axis:{axis}" if axis else None
+        return float(self.calibrator.predict(clamp01(raw_confidence), group=group))
+
+    def calibrate(self, p_raw: float, group: Optional[str] = None) -> float:
+        return float(self.calibrator.predict(clamp01(p_raw), group=group))
+
+    @classmethod
+    def from_file(cls, path: Union[str, Path]) -> "ConfidenceCalibrator":
+        path = Path(path)
+        with path.open("r", encoding="utf-8") as f:
+            obj = json.load(f)
+        calibrator = _calibrator_from_dict(obj)
+        return cls(calibrator)
+
+    @classmethod
+    def create_default(cls) -> "ConfidenceCalibrator":
+        return cls(PlattCalibrator(1.0, 0.0, "logit"))
 
 
-_CONFIGURED: Optional[ConfidenceCalibratorAdapter] = None
+_CONFIGURED: Optional[ConfidenceCalibrator] = None
 
 
-def configure_calibrator(calib: Optional[ConfidenceCalibratorAdapter]) -> None:
+def configure_calibrator(calib: Optional[ConfidenceCalibrator]) -> None:
     global _CONFIGURED
     _CONFIGURED = calib
 
@@ -512,11 +517,8 @@ def calibrate_confidence(p_raw: float, group: Optional[str] = None) -> float:
     return _CONFIGURED.calibrate(p_raw, group=group)
 
 
-def load_calibrator(path: Union[str, Path]) -> ConfidenceCalibratorAdapter:
-    path = Path(path)
-    with path.open("r", encoding="utf-8") as f:
-        base = _calibrator_from_dict(json.load(f))
-    return ConfidenceCalibratorAdapter(base)
+def load_calibrator(path: Union[str, Path]) -> ConfidenceCalibrator:
+    return ConfidenceCalibrator.from_file(path)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -619,9 +621,9 @@ __all__ = [
     "fit_isotonic",
     "fit_histogram",
     "fit_calibrator",
-    "ConfidenceCalibratorAdapter",
-    "IdeologyScoringCalibrator",
+    "ConfidenceCalibrator",
     "load_calibrator",
     "configure_calibrator",
     "calibrate_confidence",
 ]
+

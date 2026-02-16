@@ -72,9 +72,15 @@ class Settings(BaseSettings):
 
     SEMANTIC_SIMILARITY_THRESHOLD: float = Field(default=0.45)
     MAX_SENTENCES_PER_SEGMENT: int = Field(default=4)
-    KEY_STATEMENT_CONFIDENCE_MIN: float = Field(default=0.70)
-    KEY_STATEMENT_SIGNAL_MIN: float = Field(default=65.0)
+    KEY_STATEMENT_CONFIDENCE_MIN: float = Field(default=0.60)
+    KEY_STATEMENT_SIGNAL_MIN: float = Field(default=50.0)
     KEY_STATEMENT_CODES_MIN: int = Field(default=2)
+
+    ENABLE_RESEARCH_ANALYSIS: bool = Field(default=False)
+    RESEARCH_LLM_PROVIDER: str = Field(default="openai")
+    RESEARCH_LLM_MODEL: str = Field(default="gpt-4o-mini")
+    RESEARCH_MAX_STATEMENTS_PER_CALL: int = Field(default=10)
+    RESEARCH_TIMEOUT_SECONDS: int = Field(default=120)
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -85,15 +91,16 @@ class Settings(BaseSettings):
 
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
-    def construct_database_url(cls, v: Any, info: Any) -> str:
+    def construct_database_url(cls, v: Any, info: Any) -> Any:
         values = info.data
 
         if v:
-            if isinstance(v, str) and "${" in v:
+            vv = str(v)
+            if "${" in vv and isinstance(values, dict):
                 for key, val in values.items():
                     if isinstance(val, (str, int)):
-                        v = v.replace(f"${{{key}}}", str(val))
-            return str(v)
+                        vv = vv.replace(f"${{{key}}}", str(val))
+            return vv
 
         username = str(values.get("DB_USERNAME") or "postgres")
         password = values.get("DB_PASSWORD")
@@ -112,6 +119,14 @@ class Settings(BaseSettings):
         if env in ("production", "prod") and not v:
             raise ValueError("SECRET_KEY must be set in production")
         return v
+
+    @field_validator("DEFAULT_LLM_MODEL", mode="before")
+    @classmethod
+    def validate_llm_model(cls, v: Any) -> str:
+        model = str(v or "gpt-4o-mini").strip()
+        if model == "gpt-5.2":
+            return "gpt-4o-mini"
+        return model
 
     @property
     def cors_origins_list(self) -> List[str]:

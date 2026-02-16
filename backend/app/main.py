@@ -27,29 +27,31 @@ except Exception:
         ProxyHeadersMiddleware = None
 
 from app.config import ensure_runtime_directories, settings
-from app.database.connection import (
-    check_database_health,
-    close_database_connections,
-    init_db,
-)
-
-from app.api.routes.auth import router as auth_router
-from app.api.routes.users import router as users_router
-from app.api.routes.speeches import router as speeches_router
+from app.database.connection import check_database_health, close_database_connections, init_db
 from app.api.routes.analysis import router as analysis_router
+from app.api.routes.auth import router as auth_router
+from app.api.routes.speeches import router as speeches_router
+from app.api.routes.users import router as users_router
 
-LOG_LEVEL = settings.LOG_LEVEL.upper()
+LOG_LEVEL = str(settings.LOG_LEVEL or "INFO").upper()
 LOG_FILE = settings.LOG_FILE or "./app.log"
 
 log_dir = os.path.dirname(LOG_FILE)
 if log_dir:
     os.makedirs(log_dir, exist_ok=True)
 
+handlers: list[logging.Handler] = [logging.StreamHandler()]
+try:
+    handlers.append(logging.FileHandler(LOG_FILE))
+except Exception:
+    pass
+
 logging.basicConfig(
     level=LOG_LEVEL,
     format=settings.LOG_FORMAT,
-    handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE)],
+    handlers=handlers,
 )
+
 logger = logging.getLogger(__name__)
 
 
@@ -57,15 +59,17 @@ def _init_confidence_calibration() -> None:
     calib_path = os.getenv("CALIBRATOR_PATH", "calibration/calibrator.json")
     try:
         if not os.path.exists(calib_path):
-            logger.info("Confidence calibrator not found: %s", calib_path)
+            logger.info("Confidence calibrator not found at: %s (skipping calibration)", calib_path)
             return
 
-        from app.services.evaluation.calibrate import IdeologyScoringCalibrator, load_calibrator
-        from app.services.ideology_scoring import configure_calibrator as configure_scoring_calibrator
+        from app.services.evaluation.calibrate import ConfidenceCalibrator, configure_calibrator
 
-        adapter = load_calibrator(calib_path)
-        configure_scoring_calibrator(IdeologyScoringCalibrator(adapter))
-        logger.info("Confidence calibrator loaded: %s", calib_path)
+        calibrator = ConfidenceCalibrator.from_file(calib_path)
+        configure_calibrator(calibrator)
+
+        logger.info("✓ Confidence calibrator loaded successfully from: %s", calib_path)
+    except ImportError as e:
+        logger.warning("Calibration module not available: %s", e)
     except Exception as e:
         logger.warning("Confidence calibration init failed: %s", e, exc_info=True)
 
@@ -84,12 +88,16 @@ async def lifespan(app: FastAPI):
 
         _init_confidence_calibration()
 
+        logger.info("=" * 60)
+        logger.info("PDAnalyzer API Starting")
+        logger.info("=" * 60)
         logger.info("Environment: %s", settings.ENVIRONMENT)
-        logger.info("API Host: %s", settings.API_HOST)
-        logger.info("API Port: %s", settings.API_PORT)
-        logger.info("DATABASE_URL set: %s", bool(settings.DATABASE_URL))
+        logger.info("API Host: %s:%s", settings.API_HOST, settings.API_PORT)
+        logger.info("Database: %s", "Connected" if settings.DATABASE_URL else "Not configured")
         logger.info("Embedding Backend: %s", settings.EMBEDDING_BACKEND)
         logger.info("Default LLM: %s/%s", settings.DEFAULT_LLM_PROVIDER, settings.DEFAULT_LLM_MODEL)
+        logger.info("Research Analysis: %s", "Enabled" if settings.ENABLE_RESEARCH_ANALYSIS else "Disabled")
+        logger.info("=" * 60)
 
         yield
     except Exception as e:
@@ -97,6 +105,7 @@ async def lifespan(app: FastAPI):
         raise
     finally:
         try:
+            logger.info("Shutting down...")
             close_database_connections()
         except Exception as e:
             logger.error("Shutdown error: %s", e, exc_info=True)
@@ -104,7 +113,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.APP_NAME,
-    description="Advanced political speech analysis",
+    description="Advanced political speech analysis with LLM-powered discourse analysis",
     version=settings.APP_VERSION,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -112,7 +121,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-if settings.ENVIRONMENT.lower() in ("production", "prod") and ProxyHeadersMiddleware is not None:
+if str(settings.ENVIRONMENT or "").lower() in ("production", "prod") and ProxyHeadersMiddleware is not None:
     app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 os.makedirs("media", exist_ok=True)
@@ -243,6 +252,8 @@ async def system_info():
                     "max_file_size_mb": settings.DEFAULT_MAX_FILE_SIZE / 1_000_000,
                     "embedding_backend": settings.EMBEDDING_BACKEND,
                     "default_llm": f"{settings.DEFAULT_LLM_PROVIDER}/{settings.DEFAULT_LLM_MODEL}",
+                    "research_analysis": settings.ENABLE_RESEARCH_ANALYSIS,
+                    "research_llm": f"{settings.RESEARCH_LLM_PROVIDER}/{settings.RESEARCH_LLM_MODEL}",
                 },
                 "statistics": stats,
             },
@@ -261,6 +272,6 @@ if __name__ == "__main__":
         host=settings.API_HOST,
         port=settings.API_PORT,
         reload=settings.API_RELOAD,
-        log_level=settings.LOG_LEVEL.lower(),
+        log_level=str(settings.LOG_LEVEL or "info").lower(),
         access_log=True,
     )

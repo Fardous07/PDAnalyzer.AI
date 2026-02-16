@@ -1,5 +1,3 @@
-# backend/app/services/speech_ingestion.py
-
 from __future__ import annotations
 
 import asyncio
@@ -24,15 +22,17 @@ logger = logging.getLogger(__name__)
 
 MIN_TEXT_CHARS = 50
 DEFAULT_MAX_CONCURRENT = 12
-DEFAULT_CODE_THRESHOLD = 0.35
-
+DEFAULT_CODE_THRESHOLD = 0.25
 IDEOLOGICAL_FAMILIES = {LIB_FAMILY, AUTH_FAMILY, ECON_LEFT, ECON_RIGHT}
 ALLOWED_FAMILIES = IDEOLOGICAL_FAMILIES | {CENTRIST_FAMILY}
 
-STATEMENT_MIN_SENTENCES = 2
+STATEMENT_MIN_SENTENCES = 1
 STATEMENT_MAX_SENTENCES = 28
 
-ANCHOR_MIN_CONF = 0.40
+SINGLE_SENTENCE_ANCHOR_MIN_CONF = 0.25
+SINGLE_SENTENCE_MIN_EVIDENCE = 2
+SINGLE_SENTENCE_REQUIRE_COMMITMENT = True
+ANCHOR_MIN_CONF = 0.15
 ANCHOR_MIN_EVIDENCE = 1
 ANCHOR_ATTRIBUTION_MIN_CONF = 0.50
 ANCHOR_MIN_COMMITMENT = 0.45
@@ -102,6 +102,21 @@ ISSUE_TAGS_BY_CODES: Dict[str, Set[str]] = {
     "criminal_justice": {"605"},
     "privacy_autonomy": {"201", "604"},
 }
+
+
+def _family_display_name(fam: str) -> str:
+    f = (fam or "").strip()
+    if f == ECON_LEFT:
+        return "Economic-Left"
+    if f == ECON_RIGHT:
+        return "Economic-Right"
+    if f == LIB_FAMILY:
+        return "Libertarian"
+    if f == AUTH_FAMILY:
+        return "Authoritarian"
+    if f == CENTRIST_FAMILY:
+        return "Centrist"
+    return f or "Centrist"
 
 
 def _is_speaker_belief(text: str) -> bool:
@@ -229,15 +244,43 @@ def _issue_tags_from_codes(codes: List[str]) -> List[str]:
 
 def _segment_attribution(text: str, evidence: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     try:
-        span = None
+        best_span: Optional[Tuple[int, int]] = None
+        best_score = -1e18
+
         for ev in evidence or []:
-            if isinstance(ev, dict) and isinstance(ev.get("span"), (list, tuple)) and len(ev["span"]) == 2:
-                try:
-                    span = (int(ev["span"][0]), int(ev["span"][1]))
-                    break
-                except Exception:
-                    span = None
-        attr = parse_attribution(text, span)
+            if not isinstance(ev, dict):
+                continue
+
+            span = ev.get("span")
+            if not (isinstance(span, (list, tuple)) and len(span) == 2):
+                continue
+
+            try:
+                a, b = int(span[0]), int(span[1])
+            except Exception:
+                continue
+
+            if b <= a:
+                continue
+
+            score = 0.0
+
+            if bool(ev.get("attribution_hint")):
+                score += 2.0
+
+            for k in ("strength", "signal_strength", "weight", "confidence", "score", "pattern_confidence"):
+                v = ev.get(k)
+                if isinstance(v, (int, float)):
+                    score += float(v)
+
+            span_len = max(1, abs(b - a))
+            score += 0.15 * (1.0 / math.sqrt(span_len))
+
+            if score > best_score:
+                best_score = score
+                best_span = (a, b)
+
+        attr = parse_attribution(text, best_span)
         return attr if isinstance(attr, dict) else None
     except Exception:
         return None
@@ -267,13 +310,21 @@ def _attribution_inside_quotes(attr: Optional[Dict[str, Any]]) -> bool:
 
 def _normalize_family_subtype(family: str, subtype: Optional[str]) -> Tuple[str, Optional[str]]:
     fam = (family or "").strip()
+    
     if fam == "Neutral":
         fam = CENTRIST_FAMILY
+    
+    if fam in ("Economic Left", "Economic-Left", "Economic_Left"):
+        fam = ECON_LEFT
+    if fam in ("Economic Right", "Economic-Right", "Economic_Right"):
+        fam = ECON_RIGHT
+    if fam in ("Libertarian", "libertarian"):
+        fam = LIB_FAMILY
+    if fam in ("Authoritarian", "authoritarian"):
+        fam = AUTH_FAMILY
+    
     if fam not in ALLOWED_FAMILIES:
         fam = CENTRIST_FAMILY
-
-    if fam not in (LIB_FAMILY, AUTH_FAMILY):
-        return fam, None
 
     sub = (subtype or "").strip() if subtype else ""
     return fam, (sub if sub else None)
@@ -362,7 +413,7 @@ def _build_full_2d_from_masses(*, s_lib: float, s_auth: float, e_left: float, e_
     econ_coord = (e_right - e_left) / eco_total if eco_total > 0 else 0.0
 
     soc_conf = _axis_confidence(s_lib, s_auth)
-    eco_conf = _axis_confidence(e_left, e_right)
+    eco_conf = _axis_confidence(e_right, e_left)
     overall_conf = _clamp01((soc_conf + eco_conf) / 2.0)
 
     magnitude = math.sqrt((social_coord ** 2) + (econ_coord ** 2))
@@ -521,6 +572,9 @@ def _is_anchor_candidate(s: ScoredSegment) -> bool:
     if s.ideology_family not in IDEOLOGICAL_FAMILIES:
         return False
 
+    if not (bool(s.is_ideology_evidence) or bool(s.is_ideology_evidence_2d)):
+        return False
+
     conf = _clamp01(s.confidence)
     if conf < ANCHOR_MIN_CONF:
         return False
@@ -571,23 +625,29 @@ def _aggregate_2d(segs: List[ScoredSegment]) -> Dict[str, Any]:
     return _build_full_2d_from_masses(s_lib=soc_lib, s_auth=soc_auth, e_left=eco_left, e_right=eco_right)
 
 
-def _aggregate_speech_level_2d(statements: List[IdeologicalStatement]) -> Dict[str, Any]:
-    if not statements:
+def _aggregate_speech_level_2d_from_evidence(segs: List[ScoredSegment]) -> Dict[str, Any]:
+    if not segs:
         return _empty_2d()
 
     soc_lib = soc_auth = eco_left = eco_right = 0.0
 
-    for st in statements or []:
-        if st.ideology_family not in IDEOLOGICAL_FAMILIES:
+    for s in segs or []:
+        if s.ideology_family not in IDEOLOGICAL_FAMILIES:
+            continue
+        if s.is_attributed_to_others:
+            continue
+        if not (s.is_ideology_evidence or s.is_ideology_evidence_2d):
+            continue
+        if not _has_2d_mass(s.ideology_2d or {}):
             continue
 
-        block = _as_dict(st.ideology_2d or {})
+        block = _as_dict(s.ideology_2d or {})
         axis = _as_dict(block.get("axis_strengths"))
         soc = _as_dict(axis.get("social"))
         eco = _as_dict(axis.get("economic"))
 
-        w_conf = max(0.1, _clamp01(st.avg_confidence_evidence))
-        w_ev = math.log(max(0.0, float(st.total_evidence)) + 2.0)
+        w_conf = max(0.1, _clamp01(s.confidence))
+        w_ev = math.log(max(0.0, float(s.evidence_count)) + 2.0)
         weight = w_conf * w_ev
 
         soc_lib += _as_float(soc.get("libertarian", 0.0)) * weight
@@ -730,6 +790,8 @@ def _collect_cross_time_contradictions(statements: List[IdeologicalStatement]) -
                 continue
             if not _has_2d_mass(seg.ideology_2d or {}):
                 continue
+            if not (seg.is_ideology_evidence or seg.is_ideology_evidence_2d):
+                continue
 
             ev = {
                 "statement_index": si,
@@ -793,6 +855,9 @@ def _collect_cross_time_contradictions(statements: List[IdeologicalStatement]) -
 
         conf = _clamp01(0.50 * best_score + 0.25 * b["confidence"] + 0.25 * best["confidence"])
 
+        b_disp = _family_display_name(b["family"])
+        a_disp = _family_display_name(best["family"])
+
         flags.append(
             {
                 "type": "cross_time_contradiction",
@@ -803,7 +868,7 @@ def _collect_cross_time_contradictions(statements: List[IdeologicalStatement]) -
                     "start_char": belief_stmt.start_char,
                     "end_char": belief_stmt.end_char,
                     "text": belief_stmt.full_text,
-                    "ideology_family": belief_stmt.ideology_family,
+                    "ideology_family": _family_display_name(belief_stmt.ideology_family),
                 },
                 "action": {
                     "statement_index": best["statement_index"],
@@ -811,11 +876,11 @@ def _collect_cross_time_contradictions(statements: List[IdeologicalStatement]) -
                     "start_char": action_stmt.start_char,
                     "end_char": action_stmt.end_char,
                     "text": action_stmt.full_text,
-                    "ideology_family": action_stmt.ideology_family,
+                    "ideology_family": _family_display_name(action_stmt.ideology_family),
                 },
                 "severity": "warning",
                 "confidence": round(float(conf), 3),
-                "description": f"Earlier {b['family']} belief appears contradicted by later {best['family']} action on a related topic.",
+                "description": f"Earlier {b_disp} belief appears contradicted by later {a_disp} action on a related topic.",
             }
         )
 
@@ -883,7 +948,7 @@ def build_ideological_statements(scored: List[ScoredSegment]) -> List[Ideologica
             if s.is_attributed_to_others:
                 continue
 
-            base = max(s.total_strength, 1.0) * (0.5 + 0.5 * _clamp01(s.confidence))
+            base = max(float(s.total_strength), 1e-6) * (0.5 + 0.5 * _clamp01(s.confidence))
             weights[s.ideology_family] += base
 
         return max(weights.items(), key=lambda x: x[1])[0] if weights else CENTRIST_FAMILY
@@ -919,6 +984,17 @@ def build_ideological_statements(scored: List[ScoredSegment]) -> List[Ideologica
         if not buf or len(buf) < STATEMENT_MIN_SENTENCES:
             return None
 
+        if len(buf) == 1:
+            s0 = buf[0]
+            if _clamp01(s0.confidence) < SINGLE_SENTENCE_ANCHOR_MIN_CONF:
+                return None
+            ev_ok = int(s0.evidence_count or 0) >= SINGLE_SENTENCE_MIN_EVIDENCE or bool(s0.marpor_codes or [])
+            if not ev_ok:
+                return None
+            if SINGLE_SENTENCE_REQUIRE_COMMITMENT:
+                if not (s0.is_action_statement or s0.is_speaker_belief or _looks_first_person(s0.segment.text)):
+                    return None
+
         anchors = [s for s in buf if _is_anchor_candidate(s)]
         if not anchors:
             return None
@@ -934,6 +1010,9 @@ def build_ideological_statements(scored: List[ScoredSegment]) -> List[Ideologica
             and _has_2d_mass(s.ideology_2d or {})
             and not s.is_attributed_to_others
         ]
+        if not ev_segs:
+            return None
+
         total_ev = sum(max(0, int(s.evidence_count or 0)) for s in ev_segs)
 
         codes: Set[str] = set()
@@ -945,13 +1024,16 @@ def build_ideological_statements(scored: List[ScoredSegment]) -> List[Ideologica
         avg_conf_ev = (sum(_clamp01(s.confidence) for s in ev_segs) / len(ev_segs)) if ev_segs else 0.0
         avg_sig = (sum(s.signal_strength for s in ev_segs) / len(ev_segs)) if ev_segs else 0.0
 
-        ideology_2d = _aggregate_2d(ev_segs if ev_segs else anchors)
+        ideology_2d = _aggregate_2d(ev_segs)
 
         fams_present = sorted({s.ideology_family for s in ev_segs if s.ideology_family in IDEOLOGICAL_FAMILIES})
 
+        start_sentence = buf[0].segment.sentence_indices[0] if buf[0].segment.sentence_indices else 0
+        end_sentence = buf[-1].segment.sentence_indices[-1] if buf[-1].segment.sentence_indices else start_sentence
+
         return IdeologicalStatement(
-            sentence_start=buf[0].segment.sentence_indices[0],
-            sentence_end=buf[-1].segment.sentence_indices[0],
+            sentence_start=start_sentence,
+            sentence_end=end_sentence,
             start_char=buf[0].segment.start_char,
             end_char=buf[-1].segment.end_char,
             ideology_family=dom_family,
@@ -1030,35 +1112,6 @@ def build_ideological_statements(scored: List[ScoredSegment]) -> List[Ideologica
 
     _attach_cross_statement_conflicts(statements)
 
-    if not statements:
-        for seg in scored:
-            if _is_anchor_candidate(seg):
-                ev_n = max(1, int(seg.evidence_count or 0))
-                codes = seg.marpor_codes or _derive_codes_from_evidence(seg.evidence)
-                ideology_2d = _aggregate_2d([seg])
-                statements.append(
-                    IdeologicalStatement(
-                        sentence_start=seg.segment.sentence_indices[0],
-                        sentence_end=seg.segment.sentence_indices[0],
-                        start_char=seg.segment.start_char,
-                        end_char=seg.segment.end_char,
-                        ideology_family=seg.ideology_family,
-                        ideology_subtype=seg.ideology_subtype if seg.ideology_family in (LIB_FAMILY, AUTH_FAMILY) else None,
-                        sentences=[seg],
-                        full_text=seg.segment.text.strip(),
-                        anchor_count=1,
-                        total_evidence=ev_n,
-                        marpor_codes=codes,
-                        avg_confidence_evidence=float(_clamp01(seg.confidence)),
-                        max_confidence=float(_clamp01(seg.confidence)),
-                        avg_signal_strength=float(seg.signal_strength),
-                        sentence_count=1,
-                        ideology_2d=ideology_2d,
-                        conflict_info=ConflictInfo(),
-                        families_present=[seg.ideology_family],
-                    )
-                )
-
     return statements
 
 
@@ -1128,39 +1181,141 @@ def preprocess_text(text: str) -> str:
 
 
 class SentenceSplitter:
+    _ABBREV = {
+        "mr.", "mrs.", "ms.", "dr.", "prof.", "sr.", "jr.",
+        "e.g.", "i.e.", "vs.", "etc.",
+        "u.s.", "u.k.", "e.u.", "un.", "u.n.",
+    }
+
+    _CLAUSE_SPLIT_RE = re.compile(
+        r"(?:,\s+|\s+)(but|however|though|although|whereas|while|yet)\s+",
+        re.IGNORECASE,
+    )
+
     def split(self, text: str) -> List[Sentence]:
         if not text:
             return []
 
+        spans: List[Tuple[int, int]] = []
+
+        def _is_abbrev(tok: str) -> bool:
+            return (tok or "").lower().strip() in self._ABBREV
+
+        def _commit_span(a: int, b: int) -> None:
+            if b <= a:
+                return
+            while a < b and text[a].isspace():
+                a += 1
+            while b > a and text[b - 1].isspace():
+                b -= 1
+            if b > a:
+                spans.append((a, b))
+
+        start = 0
+        i = 0
+        n = len(text)
+
+        while i < n:
+            ch = text[i]
+
+            if ch == "\n":
+                j = i
+                while j < n and text[j] == "\n":
+                    j += 1
+                if j - i >= 2:
+                    _commit_span(start, i)
+                    start = j
+                    i = j
+                    continue
+                if i > start and (text[i - 1] in ".!?:;" or (i - start) >= 80):
+                    _commit_span(start, i)
+                    start = j
+                    i = j
+                    continue
+                i = j
+                continue
+
+            if ch in ".!?":
+                window = text[max(0, i - 6) : i + 1]
+                last_tok = window.split()[-1] if window.split() else window
+                if _is_abbrev(last_tok):
+                    i += 1
+                    continue
+
+                nxt = text[i + 1] if i + 1 < n else ""
+                if (i == n - 1) or nxt.isspace():
+                    _commit_span(start, i + 1)
+                    start = i + 1
+                i += 1
+                continue
+
+            if ch in ";:":
+                nxt = text[i + 1] if i + 1 < n else ""
+                if (i == n - 1) or nxt.isspace():
+                    _commit_span(start, i + 1)
+                    start = i + 1
+                i += 1
+                continue
+
+            if ch in "—–":
+                prev = text[i - 1] if i - 1 >= 0 else ""
+                nxt = text[i + 1] if i + 1 < n else ""
+                if prev.isspace() and nxt.isspace() and (i - start) >= 25:
+                    _commit_span(start, i)
+                    start = i + 1
+                i += 1
+                continue
+
+            i += 1
+
+        _commit_span(start, n)
+
+        final_spans: List[Tuple[int, int]] = []
+        for a, b in spans:
+            chunk = text[a:b]
+            if len(chunk) < 140:
+                final_spans.append((a, b))
+                continue
+
+            cuts: List[int] = []
+            for m in self._CLAUSE_SPLIT_RE.finditer(chunk):
+                cut = m.start()
+                left = chunk[:cut].strip()
+                right = chunk[m.end():].strip()
+                if len(left.split()) >= 8 and len(right.split()) >= 8:
+                    if (
+                        _is_action_statement(left)
+                        or _is_action_statement(right)
+                        or _is_speaker_belief(left)
+                        or _is_speaker_belief(right)
+                    ):
+                        cuts.append(cut)
+
+            if not cuts:
+                final_spans.append((a, b))
+                continue
+
+            last = 0
+            for cut in cuts:
+                _a = a + last
+                _b = a + cut
+                if _b - _a >= 25:
+                    final_spans.append((_a, _b))
+                last = cut
+
+            if (b - (a + last)) >= 25:
+                final_spans.append((a + last, b))
+            else:
+                if final_spans:
+                    pa, _ = final_spans[-1]
+                    final_spans[-1] = (pa, b)
+
         sentences: List[Sentence] = []
-        current = ""
-        char_pos = 0
-
-        for i, ch in enumerate(text):
-            current += ch
-            if ch in ".!?" and i < len(text) - 1 and text[i + 1] in " \n":
-                s = current.strip()
-                if s:
-                    sentences.append(
-                        Sentence(
-                            text=s,
-                            index=len(sentences),
-                            start_char=char_pos,
-                            end_char=char_pos + len(current),
-                        )
-                    )
-                char_pos += len(current)
-                current = ""
-
-        if current.strip():
-            sentences.append(
-                Sentence(
-                    text=current.strip(),
-                    index=len(sentences),
-                    start_char=char_pos,
-                    end_char=char_pos + len(current),
-                )
-            )
+        for (a, b) in final_spans:
+            s_txt = text[a:b].strip()
+            if not s_txt:
+                continue
+            sentences.append(Sentence(text=s_txt, index=len(sentences), start_char=a, end_char=b))
 
         return sentences
 
@@ -1202,10 +1357,16 @@ async def ingest_speech(
     speaker: str = "",
     *,
     use_semantic_scoring: bool = True,
+    use_research_analysis: bool = False,
     code_threshold: float = DEFAULT_CODE_THRESHOLD,
     embedder: Optional[Any] = None,
     max_concurrent: int = DEFAULT_MAX_CONCURRENT,
     top_key_statements: int = TOP_KEY_STATEMENTS,
+    llm_provider: str = "openai",
+    llm_model: str = "gpt-4o",
+    speaker_party: Optional[str] = None,
+    speaker_role: Optional[str] = None,
+    speech_context: Optional[str] = None,
 ) -> Dict[str, Any]:
     clean_text = preprocess_text(text)
     if len(clean_text) < MIN_TEXT_CHARS:
@@ -1227,18 +1388,47 @@ async def ingest_speech(
     if not scored_segments:
         return {"error": "Scoring produced no results."}
 
+    evidence_segments = [
+        s for s in scored_segments
+        if s.ideology_family in IDEOLOGICAL_FAMILIES
+        and (s.is_ideology_evidence or s.is_ideology_evidence_2d)
+        and not s.is_attributed_to_others
+        and _has_2d_mass(s.ideology_2d or {})
+    ]
+
     statements = build_ideological_statements(scored_segments)
     key_statements = select_key_statements(statements, top_n=top_key_statements)
 
-    speech_level_ideology_2d = _aggregate_speech_level_2d(statements)
+    speech_level_ideology_2d = _aggregate_speech_level_2d_from_evidence(evidence_segments)
     contradiction_flags = _collect_cross_time_contradictions(statements)
+
+    evidence_segments_out: List[Dict[str, Any]] = []
+    for seg in evidence_segments:
+        idx = seg.segment.sentence_indices[0] if seg.segment.sentence_indices else -1
+        evidence_segments_out.append(
+            {
+                "sentence_index": idx,
+                "sentence_range": [idx, idx],
+                "ideology_family": _family_display_name(seg.ideology_family),
+                "ideology_subtype": seg.ideology_subtype,
+                "start_char": seg.segment.start_char,
+                "end_char": seg.segment.end_char,
+                "confidence_score": round(_clamp01(seg.confidence), 3),
+                "signal_strength": round(float(seg.signal_strength), 2),
+                "marpor_codes": seg.marpor_codes,
+                "evidence_count": int(seg.evidence_count or 0),
+                "ideology_2d": seg.ideology_2d,
+                "issue_tags": seg.issue_tags,
+                "text": seg.segment.text,
+            }
+        )
 
     statement_list_out: List[Dict[str, Any]] = []
     for st in statements:
         statement_list_out.append(
             {
                 "sentence_range": [st.sentence_start, st.sentence_end],
-                "ideology_family": st.ideology_family,
+                "ideology_family": _family_display_name(st.ideology_family),
                 "ideology_subtype": st.ideology_subtype,
                 "start_char": st.start_char,
                 "end_char": st.end_char,
@@ -1252,7 +1442,7 @@ async def ingest_speech(
                 "is_key_statement": False,
                 "text": st.full_text,
                 "full_text": st.full_text,
-                "families_present": st.families_present,
+                "families_present": [_family_display_name(x) for x in (st.families_present or [])],
                 "conflict_info": (
                     {
                         "has_conflict": st.conflict_info.has_conflict,
@@ -1279,7 +1469,7 @@ async def ingest_speech(
                 "text": ks.text,
                 "context_before": before,
                 "context_after": after,
-                "ideology_family": ks.ideology_family,
+                "ideology_family": _family_display_name(ks.ideology_family),
                 "ideology_subtype": ks.ideology_subtype,
                 "confidence": round(ks.confidence, 3),
                 "keyness_score": round(ks.keyness_score, 3),
@@ -1296,14 +1486,51 @@ async def ingest_speech(
             }
         )
 
+    ideology_counts = {LIB_FAMILY: 0, AUTH_FAMILY: 0, ECON_LEFT: 0, ECON_RIGHT: 0}
+    for seg in scored_segments:
+        if seg.ideology_family in IDEOLOGICAL_FAMILIES:
+            ideology_counts[seg.ideology_family] += 1
+
+    all_ideological = [s for s in scored_segments if s.ideology_family in IDEOLOGICAL_FAMILIES]
+    ideological_sentences = int(len(all_ideological))
+    if all_ideological:
+        avg_conf = sum(_clamp01(s.confidence) for s in all_ideological) / len(all_ideological)
+        avg_sig = sum(float(s.signal_strength) for s in all_ideological) / len(all_ideological)
+    else:
+        avg_conf = 0.0
+        avg_sig = 0.0
+
+    all_marpor: Set[str] = set()
+    for seg in scored_segments:
+        for code in (seg.marpor_codes or []):
+            if code:
+                all_marpor.add(str(code))
+
+    analysis_summary = {
+        "evidence_counts": {
+            _family_display_name(LIB_FAMILY): ideology_counts[LIB_FAMILY],
+            _family_display_name(AUTH_FAMILY): ideology_counts[AUTH_FAMILY],
+            _family_display_name(ECON_LEFT): ideology_counts[ECON_LEFT],
+            _family_display_name(ECON_RIGHT): ideology_counts[ECON_RIGHT],
+        },
+        "total_evidence": int(sum(ideology_counts.values())),
+        "ideological_statements": int(ideological_sentences),
+        "total_statements": int(len(scored_segments)),
+        "avg_confidence_score": round(float(avg_conf), 4),
+        "avg_signal_strength": round(float(avg_sig), 2),
+        "key_statement_count": int(len(key_statements)),
+        "marpor_codes": sorted(all_marpor),
+        "notes": ["Generated from all scored segments with ideology classification"],
+    }
+
     centrist_sentences = sum(1 for s in scored_segments if s.ideology_family == CENTRIST_FAMILY)
-    ideological_sentences = sum(1 for s in scored_segments if s.ideology_family in IDEOLOGICAL_FAMILIES)
     anchor_sentences = sum(1 for s in scored_segments if _is_anchor_candidate(s))
     conflict_count = sum(1 for st in statements if st.conflict_info.has_conflict)
 
-    return {
+    result: Dict[str, Any] = {
         "text": clean_text,
         "ideology_2d": speech_level_ideology_2d,
+        "analysis_summary": analysis_summary,
         "speech_level": {
             "total_sentences": len(scored_segments),
             "ideological_sentences": ideological_sentences,
@@ -1315,6 +1542,7 @@ async def ingest_speech(
             "contradiction_flag_count": int(len(contradiction_flags)),
             "ideology_2d": speech_level_ideology_2d,
         },
+        "evidence_segments": evidence_segments_out,
         "statements": statement_list_out,
         "key_statements": key_statements_out,
         "contradiction_flags": contradiction_flags,
@@ -1332,9 +1560,112 @@ async def ingest_speech(
                 "centrist_is_non_ideology": True,
                 "axis_min_total": AXIS_MIN_TOTAL,
                 "attr_hint_ratio_threshold": ATTR_HINT_RATIO_THRESHOLD,
+                "speech_2d_source": "evidence_segments_only",
             },
         },
     }
+
+    if use_research_analysis and statements:
+        try:
+            from app.services.llm_discourse_analyzer import (
+                llm_analyze_ideological_discourse,
+                apply_discourse_analysis_to_statements,
+            )
+
+            speaker_info = {
+                "name": speaker or "Unknown",
+                "party": speaker_party or "Unknown",
+                "role": speaker_role or "Unknown",
+                "context": speech_context or speech_title or "Unknown",
+            }
+
+            statements_for_analysis = [
+                {
+                    "text": st_dict["full_text"],
+                    "full_text": st_dict["full_text"],
+                    "ideology_family": st_dict["ideology_family"],
+                    "ideology_subtype": st_dict.get("ideology_subtype"),
+                    "confidence_score": st_dict["confidence_score"],
+                    "marpor_codes": st_dict["marpor_codes"],
+                    "sentence_range": st_dict["sentence_range"],
+                }
+                for st_dict in statement_list_out
+            ]
+
+            discourse_result = await llm_analyze_ideological_discourse(
+                statements=statements_for_analysis,
+                speaker_info=speaker_info,
+                historical_context=None,
+                llm_provider=llm_provider,
+                llm_model=llm_model,
+            )
+
+            research_analysis = {
+                "consistency_score": discourse_result.consistency_score,
+                "ideological_coherence": discourse_result.ideological_coherence,
+                "authenticity_score": discourse_result.authenticity_score,
+                "strategic_positioning_score": discourse_result.strategic_positioning_score,
+                "rhetorical_complexity": discourse_result.rhetorical_complexity,
+                "populist_score": discourse_result.populist_rhetoric.score,
+                "contradictions_count": len(discourse_result.contradictions),
+                "coded_language_count": len(discourse_result.coded_language),
+                "contradictions": [
+                    {
+                        "statement_indices": list(c.statement_indices),
+                        "type": c.contradiction_type,
+                        "severity": c.severity,
+                        "description": c.description,
+                        "confidence": c.confidence,
+                    }
+                    for c in discourse_result.contradictions
+                ],
+                "coded_language": [
+                    {
+                        "phrase": cl.phrase,
+                        "implicit_meaning": cl.implicit_meaning,
+                        "confidence": cl.confidence,
+                        "direction": cl.ideological_direction,
+                    }
+                    for cl in discourse_result.coded_language
+                ],
+                "framing_patterns": [
+                    {
+                        "domain": fp.issue_domain,
+                        "frame": fp.frame_label,
+                        "valence": fp.ideological_valence,
+                    }
+                    for fp in discourse_result.framing_patterns
+                ],
+                "trajectory": {
+                    "direction": discourse_result.trajectory.direction,
+                    "magnitude": discourse_result.trajectory.magnitude,
+                },
+                "research_insights": discourse_result.research_insights,
+            }
+
+            enriched = apply_discourse_analysis_to_statements(
+                statements_for_analysis,
+                discourse_result,
+            )
+
+            if isinstance(enriched, list):
+                for i, upd in enumerate(enriched):
+                    if i >= len(statement_list_out):
+                        break
+                    if isinstance(upd, dict):
+                        merged = dict(statement_list_out[i])
+                        merged.update(upd)
+                        statement_list_out[i] = merged
+
+                result["statements"] = statement_list_out
+
+            result["research_analysis"] = research_analysis
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.error(f"Research analysis failed: {e}", exc_info=True)
+
+    return result
 
 
 __all__ = [

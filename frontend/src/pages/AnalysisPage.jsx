@@ -12,6 +12,7 @@ import {
   Copy,
   Cpu,
   Database,
+  DollarSign,
   Download,
   FileText,
   Filter,
@@ -32,24 +33,24 @@ import {
   SkipBack,
   SkipForward,
   Sparkles,
-  Target as TargetIcon,
+  Target,
   TrendingUp,
   User,
   Volume2,
   VolumeX,
   X,
   Zap,
-  DollarSign,
 } from "lucide-react";
 
 import apiClient, { API_BASE_URL, getAnalysis, getAnalysisLegacy } from "../services/api";
+
+/* ----------------------------- Constants ----------------------------- */
 
 const LIB = "Libertarian";
 const AUTH = "Authoritarian";
 const ECON_LEFT = "Economic-Left";
 const ECON_RIGHT = "Economic-Right";
 
-const AXIS_MIN_TOTAL = 0.05;
 const AXIS_CENTER_BAND = 0.25;
 
 const COLORS = {
@@ -73,36 +74,36 @@ const COLORS = {
   glass: { border: "rgba(255,255,255,0.10)" },
 };
 
-function unwrapResponseLocal(input) {
-  if (input && typeof input === "object" && "status" in input && "data" in input) {
-    return unwrapResponseLocal(input.data);
-  }
+const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
+const safeNum = (x, def = 0) => {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : def;
+};
+
+/* ------------------------------ Helpers ------------------------------ */
+
+function unwrapResponse(input) {
+  // Handles backend pattern: { success, data, error, message, ... }
   if (input && typeof input === "object" && "success" in input) {
-    if (input.success === false) {
-      throw new Error(input.error || input.message || input.detail || "Request failed");
-    }
-    if ("data" in input) return input.data;
-    return input;
+    if (input.success === false) throw new Error(input.error || input.message || "Request failed");
+    return "data" in input ? input.data : input;
   }
   return input;
 }
 
-function extractBackendMessageLocal(responseData) {
-  if (!responseData) return null;
-  if (typeof responseData === "string") {
-    const s = responseData.trim();
-    return s ? s : null;
-  }
-  if (typeof responseData === "object") {
-    if (typeof responseData.detail === "string" && responseData.detail.trim()) return responseData.detail.trim();
-    if (typeof responseData.message === "string" && responseData.message.trim()) return responseData.message.trim();
-    if (typeof responseData.error === "string" && responseData.error.trim()) return responseData.error.trim();
-    if (responseData.error && typeof responseData.error === "object") {
-      if (typeof responseData.error.message === "string" && responseData.error.message.trim())
-        return responseData.error.message.trim();
-    }
+function extractBackendMessage(err) {
+  const d = err?.response?.data ?? err;
+  if (!d) return null;
+  if (typeof d === "string") return d.trim() || null;
+  if (typeof d === "object") {
+    const s =
+      (typeof d.detail === "string" && d.detail.trim()) ||
+      (typeof d.message === "string" && d.message.trim()) ||
+      (typeof d.error === "string" && d.error.trim()) ||
+      (typeof d?.error?.message === "string" && d.error.message.trim());
+    if (s) return s;
     try {
-      return JSON.stringify(responseData);
+      return JSON.stringify(d);
     } catch {
       return null;
     }
@@ -110,162 +111,16 @@ function extractBackendMessageLocal(responseData) {
   return null;
 }
 
-function toAbsoluteUrl(urlLike) {
-  const s = String(urlLike || "").trim();
+function joinBaseUrl(base, pathLike) {
+  const baseClean = String(base || "").replace(/\/+$/, "");
+  const s = String(pathLike || "").trim();
   if (!s) return null;
   if (/^https?:\/\//i.test(s)) return s;
-  const path = s.startsWith("/") ? s : `/${s}`;
-  return `${API_BASE_URL}${path}`;
+  const p = s.startsWith("/") ? s : `/${s}`;
+  return `${baseClean}${p}`;
 }
 
-async function getSpeechSafe(speechId) {
-  const id = encodeURIComponent(String(speechId));
-  const candidates = [
-    `/api/speeches/${id}`,
-    `/api/speeches/${id}/detail`,
-    `/api/speech/${id}`,
-    `/api/speeches?id=${id}`,
-  ];
-
-  let lastErr = null;
-  for (const url of candidates) {
-    try {
-      const res = await apiClient.get(url);
-      return unwrapResponseLocal(res.data);
-    } catch (e) {
-      lastErr = e;
-      const st = e?.response?.status;
-      if (st && st !== 404 && st !== 405) break;
-    }
-  }
-
-  const msg =
-    extractBackendMessageLocal(lastErr?.response?.data) ||
-    lastErr?.message ||
-    "Failed to load speech.";
-  throw new Error(msg);
-}
-
-async function getSpeechFullSafe(speechId) {
-  const id = encodeURIComponent(String(speechId));
-  const candidates = [
-    `/api/speeches/${id}/full`,
-    `/api/speeches/${id}/full_text`,
-    `/api/speeches/${id}/transcript`,
-    `/api/speeches/${id}?full=1`,
-  ];
-
-  let lastErr = null;
-  for (const url of candidates) {
-    try {
-      const res = await apiClient.get(url);
-      return unwrapResponseLocal(res.data);
-    } catch (e) {
-      lastErr = e;
-      const st = e?.response?.status;
-      if (st && st !== 404 && st !== 405) break;
-    }
-  }
-
-  return getSpeechSafe(speechId);
-}
-
-async function generateQuestionsSafe(speechId, { question_type = "journalistic", max_questions = 5 } = {}) {
-  const id = encodeURIComponent(String(speechId));
-  const sid = Number(speechId);
-  const payload = {
-    ...(Number.isFinite(sid) ? { speech_id: sid } : {}),
-    question_type,
-    max_questions,
-  };
-
-    const candidates = [
-    { method: "post", url: `/api/speeches/${id}/questions/generate` },
-    { method: "post", url: `/api/speeches/${id}/questions` },
-    { method: "post", url: `/api/speeches/${id}/generate_questions` },
-    { method: "post", url: `/api/questions/generate` },
-    { method: "post", url: `/api/generate_questions` },
-    { method: "post", url: `/api/questions` },
-  ];
-
-  let lastErr = null;
-  for (const c of candidates) {
-    try {
-      const res = await apiClient[c.method](withForce(c.url), payload);
-      return unwrapResponseLocal(res.data);
-    } catch (e) {
-      lastErr = e;
-      const st = e?.response?.status;
-      if (st && st !== 404 && st !== 405) break;
-    }
-  }
-
-  const msg =
-    extractBackendMessageLocal(lastErr?.response?.data) ||
-    lastErr?.message ||
-    "Failed to generate questions.";
-  throw new Error(msg);
-}
-
-async function reanalyzeSpeechSafe(speechId, opts = {}) {
-  const id = encodeURIComponent(String(speechId));
-  const sid = Number(speechId);
-  const payload = {
-    ...opts,
-    ...(Number.isFinite(sid) ? { speech_id: sid } : {}),
-  };
-  const force = Boolean(opts && opts.force);
-  const withForce = (url) => {
-    if (!force) return url;
-    return url.includes("?") ? `${url}&force=true` : `${url}?force=true`;
-  };
-
-  const candidates = [
-    { method: "post", url: `/api/speeches/${id}/analyze` },
-    { method: "post", url: `/api/speeches/${id}/analysis/reanalyze` },
-    { method: "post", url: `/api/speeches/${id}/reanalyze` },
-    { method: "post", url: `/api/speeches/${id}/analysis` },
-    { method: "post", url: `/api/analysis/${id}/reanalyze` },
-    { method: "post", url: `/api/analysis/reanalyze` },
-  ];
-
-  let lastErr = null;
-  for (const c of candidates) {
-    try {
-      const res = await apiClient[c.method](c.url, payload);
-      return unwrapResponseLocal(res.data);
-    } catch (e) {
-      lastErr = e;
-      const st = e?.response?.status;
-      if (st && st !== 404 && st !== 405) break;
-    }
-  }
-
-  if (lastErr) {
-    const st = lastErr?.response?.status;
-    if (st === 404 || st === 405) return null;
-    const msg =
-      extractBackendMessageLocal(lastErr?.response?.data) ||
-      lastErr?.message ||
-      "Failed to re-analyze.";
-    throw new Error(msg);
-  }
-  return null;
-}
-
-const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
-const safeNum = (x, def = 0) => {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : def;
-};
-
-const firstFinite = (...vals) => {
-  for (const v of vals) {
-    const n = Number(v);
-    if (Number.isFinite(n)) return n;
-  }
-  return NaN;
-};
+const toAbsoluteUrl = (urlLike) => joinBaseUrl(API_BASE_URL, urlLike);
 
 const formatClock = (seconds) => {
   if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return "0:00";
@@ -282,8 +137,6 @@ const formatTimeFull = (seconds) => {
   if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
   return `${m}:${String(sec).padStart(2, "0")}`;
 };
-
-const formatQuadrantLabel = (name) => String(name || "").replaceAll("-", " ").trim();
 
 const confidenceTier = (s) => {
   const v = clamp(safeNum(s, 0), 0, 1);
@@ -328,9 +181,7 @@ const downloadTextFile = (filename, text) => {
 };
 
 const downloadJsonFile = (filename, obj) => {
-  const blob = new Blob([JSON.stringify(obj || {}, null, 2)], {
-    type: "application/json;charset=utf-8",
-  });
+  const blob = new Blob([JSON.stringify(obj || {}, null, 2)], { type: "application/json;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -350,17 +201,10 @@ const snippetAroundSpan = (fullText, startChar, endChar, windowChars = 240) => {
   const t = String(fullText || "");
   const sc = Number.isFinite(Number(startChar)) ? Number(startChar) : null;
   const ec = Number.isFinite(Number(endChar)) ? Number(endChar) : null;
-  if (!t || sc === null || ec === null || sc < 0 || ec < 0 || ec < sc) {
-    return { before: "", after: "" };
-  }
-
+  if (!t || sc === null || ec === null || sc < 0 || ec < 0 || ec < sc) return { before: "", after: "" };
   const beforeStart = Math.max(0, sc - windowChars);
   const afterEnd = Math.min(t.length, ec + windowChars);
-
-  const before = t.slice(beforeStart, sc).trim();
-  const after = t.slice(ec, afterEnd).trim();
-
-  return { before, after };
+  return { before: t.slice(beforeStart, sc).trim(), after: t.slice(ec, afterEnd).trim() };
 };
 
 const getContextForItem = (item, transcriptText) => {
@@ -377,61 +221,32 @@ const stableItemKey = (it) => {
   return `${sc}::${ec}::${tx}`;
 };
 
-const MarporChips = ({ codes }) => {
-  const arr = Array.isArray(codes) ? codes.map((c) => String(c || "").trim()).filter(Boolean) : [];
-  if (!arr.length) return null;
-
-  return (
-    <div className="flex flex-wrap gap-2 mt-2">
-      {arr.slice(0, 10).map((c) => (
-        <span
-          key={c}
-          className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-extrabold tracking-wide uppercase"
-          style={{
-            background: "rgba(255,255,255,0.06)",
-            border: "1px solid rgba(255,255,255,0.10)",
-            color: "rgba(255,255,255,0.80)",
-          }}
-          title="MARPOR code"
-        >
-          <Code className="w-3 h-3 text-gray-300" />
-          {c}
-        </span>
-      ))}
-      {arr.length > 10 ? <span className="text-[10px] text-gray-500 ml-1">+{arr.length - 10}</span> : null}
-    </div>
-  );
-};
-
-const ContextToggle = ({ open, onToggle }) => (
-  <button
-    onClick={onToggle}
-    className="px-2 py-1 rounded-lg bg-gray-800/50 hover:bg-gray-700/50 border border-gray-700/50 text-xs font-extrabold text-gray-200 inline-flex items-center gap-2 transition"
-    type="button"
-    title="Show context before/after"
-  >
-    <Info className="w-4 h-4 text-gray-300" />
-    Context
-    {open ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-  </button>
-);
-
 const normalizeFamily = (fam) => {
-  const f = String(fam || "").trim();
-  if (f === LIB || f === AUTH || f === ECON_LEFT || f === ECON_RIGHT) return f;
-  if (f === "Centrist" || f === "Neutral" || !f) return null;
+  const raw = String(fam || "").trim();
+  if (!raw) return null;
+
+  const s = raw.toLowerCase().replace(/[\s_]+/g, "-");
+
+
+  if (s.includes("libertarian") || s === "lib") return LIB;
+  if (s.includes("authoritarian") || s === "auth") return AUTH;
+
+  if (s.includes("left") && s.includes("econom")) return ECON_LEFT;
+  if (s.includes("right") && s.includes("econom")) return ECON_RIGHT;
+  if (s === "left") return ECON_LEFT;  
+  if (s === "right") return ECON_RIGHT;  
+
+  if (s === "centrist" || s === "neutral" || s.includes("no-signal")) return null;
+
   return null;
 };
 
 const normalizeEvidenceItem = (item) => {
-  if (!item || typeof item !== "object") return item;
-
+  if (!item || typeof item !== "object") return null;
   const famRaw = item.ideology_family || item.family || item.dominant_family || item.label_family;
   const subRaw = item.ideology_subtype || item.subtype || item.dominant_subtype || item.label_subtype;
-
   const fam = normalizeFamily(famRaw);
   const signal = clamp(safeNum(item.signal_strength || item.signal, 0), 0, 100);
-
   const tb = item.time_begin ?? item.start_time ?? item.startTime ?? null;
   const te = item.time_end ?? item.end_time ?? item.endTime ?? null;
 
@@ -458,42 +273,29 @@ const normalizeEvidenceItem = (item) => {
 
 const extractKeyStatements = (data) => {
   const root = getAnalysisRoot(data);
-  if (!root) return [];
-
-  const statements = root.key_statements || root.key_segments || root.highlights || root.key_evidence;
-  if (Array.isArray(statements) && statements.length > 0) {
-    return statements.filter(Boolean).map(normalizeEvidenceItem).filter(Boolean);
-  }
-  return [];
+  const arr = root?.key_statements || root?.key_segments || root?.highlights || root?.key_evidence;
+  return Array.isArray(arr) ? arr.map(normalizeEvidenceItem).filter(Boolean) : [];
 };
 
 const extractSegments = (data) => {
   const root = getAnalysisRoot(data);
-  if (!root) return [];
-
   for (const src of [
-    root.statements,
-    root.sections,
-    root.segments,
-    root.statement_list,
-    root.evidence_segments,
-    root.sentence_segments,
+    root?.statements,
+    root?.sections,
+    root?.segments,
+    root?.statement_list,
+    root?.evidence_segments,
+    root?.sentence_segments,
   ]) {
-    if (Array.isArray(src) && src.length > 0) {
-      return src.filter(Boolean).map(normalizeEvidenceItem).filter(Boolean);
-    }
+    if (Array.isArray(src) && src.length) return src.map(normalizeEvidenceItem).filter(Boolean);
   }
-
-  return extractKeyStatements(root);
+  return [];
 };
 
 const extractArgumentUnits = (data) => {
   const root = getAnalysisRoot(data);
-  if (!root) return [];
-
-  const argUnits = root.argument_units;
+  const argUnits = root?.argument_units;
   if (!Array.isArray(argUnits)) return [];
-
   return argUnits
     .filter((u) => u && typeof u === "object")
     .map((u) => ({
@@ -508,13 +310,15 @@ const extractArgumentUnits = (data) => {
       time_begin: Number.isFinite(Number(u.time_begin)) ? Number(u.time_begin) : null,
       time_end: Number.isFinite(Number(u.time_end)) ? Number(u.time_end) : null,
       spans: Array.isArray(u.spans)
-        ? u.spans.map((sp) => ({
-            ...sp,
-            role: String(sp.role || "transition"),
-            text: String(sp.text || ""),
-            time_begin: Number.isFinite(Number(sp.time_begin)) ? Number(sp.time_begin) : null,
-            time_end: Number.isFinite(Number(sp.time_end)) ? Number(sp.time_end) : null,
-          }))
+        ? u.spans
+            .filter((sp) => sp && typeof sp === "object")
+            .map((sp) => ({
+              ...sp,
+              role: String(sp.role || "transition"),
+              text: String(sp.text || ""),
+              time_begin: Number.isFinite(Number(sp.time_begin)) ? Number(sp.time_begin) : null,
+              time_end: Number.isFinite(Number(sp.time_end)) ? Number(sp.time_end) : null,
+            }))
         : [],
       ideology_2d: u.ideology_2d && typeof u.ideology_2d === "object" ? u.ideology_2d : null,
     }));
@@ -523,15 +327,9 @@ const extractArgumentUnits = (data) => {
 const dedupeEvidence = (arr = []) => {
   const seen = new Set();
   const out = [];
-  const keyFor = (it) => {
-    const sc = Number.isFinite(Number(it?.start_char)) ? Number(it.start_char) : "";
-    const ec = Number.isFinite(Number(it?.end_char)) ? Number(it.end_char) : "";
-    const tx = String(it?.text || it?.full_text || "").slice(0, 200);
-    return `${sc}::${ec}::${tx}`;
-  };
   for (const it of Array.isArray(arr) ? arr : []) {
     if (!it || typeof it !== "object") continue;
-    const k = keyFor(it);
+    const k = stableItemKey(it);
     if (seen.has(k)) continue;
     seen.add(k);
     out.push(it);
@@ -539,82 +337,13 @@ const dedupeEvidence = (arr = []) => {
   return out;
 };
 
-const normalizeAnalysisSummary = (summaryObj, { keyStatements = [], argumentUnits = [] } = {}) => {
-  const s = getAnalysisRoot(summaryObj) || {};
-  const countsRaw = s?.evidence_counts || s?.statement_counts_by_family_ideology || {};
-
-  const counts = {
-    [LIB]: safeNum(countsRaw?.[LIB], 0),
-    [AUTH]: safeNum(countsRaw?.[AUTH], 0),
-    [ECON_LEFT]: safeNum(countsRaw?.[ECON_LEFT], 0),
-    [ECON_RIGHT]: safeNum(countsRaw?.[ECON_RIGHT], 0),
-  };
-
-  const sumCounts = Object.values(counts).reduce((a, b) => a + safeNum(b, 0), 0);
-  const totalEvidenceFromBackend = firstFinite(s?.total_evidence, s?.ideological_statements);
-
-  const total_evidence =
-    Number.isFinite(totalEvidenceFromBackend) && totalEvidenceFromBackend >= 0 ? totalEvidenceFromBackend : sumCounts;
-
-  const marporCodes = Array.isArray(s?.marpor_codes) ? s.marpor_codes : [];
-
-  return {
-    ...(s && typeof s === "object" ? s : {}),
-    evidence_counts: counts,
-    total_evidence: Math.max(0, safeNum(total_evidence, 0)),
-    avg_confidence_score: clamp(safeNum(s?.avg_confidence_score, 0), 0, 1),
-    avg_signal_strength: clamp(safeNum(s?.avg_signal_strength, 0), 0, 100),
-    key_statement_count: safeNum(s?.key_statement_count, Array.isArray(keyStatements) ? keyStatements.length : 0),
-    argument_unit_count: safeNum(s?.argument_unit_count, Array.isArray(argumentUnits) ? argumentUnits.length : 0),
-    pivot_unit_count: safeNum(
-      s?.pivot_unit_count,
-      Array.isArray(argumentUnits) ? argumentUnits.filter((u) => Boolean(u?.pivot_detected)).length : 0
-    ),
-    marpor_codes: marporCodes,
-  };
-};
-
-const extractAnalysisSummary = (data, { segments = [], keyStatements = [], argumentUnits = [] } = {}) => {
-  const root = getAnalysisRoot(data);
-  if (!root) return null;
-
-  if (root.analysis_summary && typeof root.analysis_summary === "object") {
-    return normalizeAnalysisSummary(root.analysis_summary, { segments, keyStatements, argumentUnits });
-  }
-
-  const all = dedupeEvidence([...(Array.isArray(segments) ? segments : []), ...(Array.isArray(keyStatements) ? keyStatements : [])]);
-
+const computeFamilyCounts = (items = []) => {
   const counts = { [LIB]: 0, [AUTH]: 0, [ECON_LEFT]: 0, [ECON_RIGHT]: 0 };
-  let wConfNum = 0;
-  let wSigNum = 0;
-  let wDen = 0;
-  const marpor = new Set();
-
-  for (const it of all) {
-    const fam = normalizeFamily(it.ideology_family);
+  for (const it of Array.isArray(items) ? items : []) {
+    const fam = normalizeFamily(it?.ideology_family);
     if (fam) counts[fam] += 1;
-
-    const w = 1;
-    wConfNum += clamp(safeNum(it.confidence_score, 0), 0, 1) * w;
-    wSigNum += clamp(safeNum(it.signal_strength, 0), 0, 100) * w;
-    wDen += w;
-
-    for (const c of Array.isArray(it.marpor_codes) ? it.marpor_codes : []) {
-      const cs = String(c || "").trim();
-      if (cs) marpor.add(cs);
-    }
   }
-
-  return {
-    evidence_counts: counts,
-    total_evidence: Object.values(counts).reduce((a, b) => a + safeNum(b, 0), 0),
-    avg_confidence_score: wDen > 0 ? wConfNum / wDen : 0,
-    avg_signal_strength: wDen > 0 ? wSigNum / wDen : 0,
-    key_statement_count: Array.isArray(keyStatements) ? keyStatements.length : 0,
-    argument_unit_count: Array.isArray(argumentUnits) ? argumentUnits.length : 0,
-    pivot_unit_count: Array.isArray(argumentUnits) ? argumentUnits.filter((u) => Boolean(u?.pivot_detected)).length : 0,
-    marpor_codes: Array.from(marpor),
-  };
+  return counts;
 };
 
 const coordFromMasses = (pos, neg) => {
@@ -627,7 +356,6 @@ const coordFromMasses = (pos, neg) => {
 const buildQuadrantFromCoords = (social, econ) => {
   const socialDir = Math.abs(social) >= AXIS_CENTER_BAND ? (social > 0 ? LIB : AUTH) : "";
   const econDir = Math.abs(econ) >= AXIS_CENTER_BAND ? (econ > 0 ? ECON_RIGHT : ECON_LEFT) : "";
-
   let name = "";
   if (socialDir && econDir) name = `${socialDir}-${econDir}`;
   else if (socialDir) name = socialDir;
@@ -643,41 +371,52 @@ const buildQuadrantFromCoords = (social, econ) => {
 };
 
 const normalizeIdeology2DFromBackend = (block) => {
-  const b = getAnalysisRoot(block);
-  if (!b || typeof b !== "object") return null;
+  // Backend canonical: ideology_2d.axis_strengths, coordinates, confidence_2d, quadrant_2d
+  if (!block || typeof block !== "object") return null;
 
-  const soc = b.axis_strengths?.social || {};
-  const eco = b.axis_strengths?.economic || {};
+  const axis = block.axis_strengths || {};
+  const soc = axis.social || {};
+  const eco = axis.economic || {};
 
-  const sLib = Math.max(0, safeNum(soc.libertarian));
-  const sAuth = Math.max(0, safeNum(soc.authoritarian));
-  const eLeft = Math.max(0, safeNum(eco.left));
-  const eRight = Math.max(0, safeNum(eco.right));
+  const sLib = Math.max(0, safeNum(soc.libertarian, 0));
+  const sAuth = Math.max(0, safeNum(soc.authoritarian, 0));
+  const eLeft = Math.max(0, safeNum(eco.left, 0));
+  const eRight = Math.max(0, safeNum(eco.right, 0));
 
-  const socialTotal = sLib + sAuth;
-  const econTotal = eLeft + eRight;
+  const socialTotal = safeNum(soc.total, sLib + sAuth);
+  const econTotal = safeNum(eco.total, eLeft + eRight);
 
-  const coords = b.coordinates || b.coords || {};
-  let socialCoord = clamp(safeNum(coords.social ?? coords.y, NaN), -1, 1);
-  let econCoord = clamp(safeNum(coords.economic ?? coords.x, NaN), -1, 1);
+  const coords = block.coordinates || {};
+  const coordsXY = block.coordinates_xy || {};
+  let socialCoord = clamp(safeNum(coords.social ?? coordsXY.y, NaN), -1, 1);
+  let econCoord = clamp(safeNum(coords.economic ?? coordsXY.x, NaN), -1, 1);
 
   if (!Number.isFinite(socialCoord) && socialTotal > 0) socialCoord = coordFromMasses(sLib, sAuth);
   if (!Number.isFinite(econCoord) && econTotal > 0) econCoord = coordFromMasses(eRight, eLeft);
-
   if (!Number.isFinite(socialCoord)) socialCoord = 0;
   if (!Number.isFinite(econCoord)) econCoord = 0;
 
-  if (socialTotal < AXIS_MIN_TOTAL) socialCoord = 0;
-  if (econTotal < AXIS_MIN_TOTAL) econCoord = 0;
+  const conf2d = block.confidence_2d || block.confidence || {};
+  const socialConf = clamp(safeNum(conf2d.social, 0), 0, 1);
+  const econConf = clamp(safeNum(conf2d.economic, 0), 0, 1);
+  const overallConf = clamp(safeNum(conf2d.overall, (socialConf + econConf) / 2), 0, 1);
 
+  // "No signal" if everything is zero-ish
   if (socialTotal <= 0 && econTotal <= 0 && socialCoord === 0 && econCoord === 0) return null;
 
-  const conf2d = b.confidence_2d || b.confidence || {};
-  let socialConf = clamp(safeNum(conf2d.social), 0, 1);
-  let econConf = clamp(safeNum(conf2d.economic), 0, 1);
-  if (socialTotal < AXIS_MIN_TOTAL) socialConf = 0;
-  if (econTotal < AXIS_MIN_TOTAL) econConf = 0;
-  const overallConf = clamp(safeNum(conf2d.overall, (socialConf + econConf) / 2), 0, 1);
+  const quadrantBackend = block.quadrant_2d || block.quadrant || null;
+  const quadrant =
+    quadrantBackend && typeof quadrantBackend === "object"
+      ? {
+          name:
+            String(quadrantBackend.name || quadrantBackend?.axis_directions ? "" : quadrantBackend.name || "").trim() ||
+            "",
+          intensity: quadrantBackend.intensity,
+          magnitude: safeNum(quadrantBackend.magnitude, Math.sqrt(socialCoord ** 2 + econCoord ** 2)),
+        }
+      : null;
+
+  const computedQuadrant = buildQuadrantFromCoords(socialCoord, econCoord);
 
   return {
     axis_strengths: {
@@ -686,48 +425,125 @@ const normalizeIdeology2DFromBackend = (block) => {
     },
     coordinates: { social: socialCoord, economic: econCoord },
     confidence_2d: { social: socialConf, economic: econConf, overall: overallConf },
-    quadrant: buildQuadrantFromCoords(socialCoord, econCoord),
+    quadrant: {
+      ...computedQuadrant,
+      ...(quadrant ? { magnitude: safeNum(quadrant.magnitude, computedQuadrant.magnitude) } : {}),
+    },
   };
 };
 
-const aggregateIdeology2DFromItems = (items = []) => {
-  let sLib = 0,
-    sAuth = 0,
-    eLeft = 0,
-    eRight = 0;
+const buildIdeology2D = (segmentCounts, backend2d = null) => {
+  const normalizedBackend = normalizeIdeology2DFromBackend(backend2d);
+  if (normalizedBackend) return normalizedBackend;
 
-  for (const it of Array.isArray(items) ? items : []) {
-    const d = it?.ideology_2d;
-    if (!d || typeof d !== "object") continue;
-    const ss = d.axis_strengths?.social;
-    const es = d.axis_strengths?.economic;
-    if (ss) {
-      sLib += Math.max(0, safeNum(ss.libertarian));
-      sAuth += Math.max(0, safeNum(ss.authoritarian));
-    }
-    if (es) {
-      eLeft += Math.max(0, safeNum(es.left));
-      eRight += Math.max(0, safeNum(es.right));
-    }
-  }
+  const lib = safeNum(segmentCounts?.[LIB], 0);
+  const auth = safeNum(segmentCounts?.[AUTH], 0);
+  const left = safeNum(segmentCounts?.[ECON_LEFT], 0);
+  const right = safeNum(segmentCounts?.[ECON_RIGHT], 0);
 
-  const socialTotal = sLib + sAuth;
-  const econTotal = eLeft + eRight;
+  const socialTotal = lib + auth;
+  const econTotal = left + right;
   if (socialTotal <= 0 && econTotal <= 0) return null;
 
-  const socialCoord = socialTotal < AXIS_MIN_TOTAL ? 0 : coordFromMasses(sLib, sAuth);
-  const econCoord = econTotal < AXIS_MIN_TOTAL ? 0 : coordFromMasses(eRight, eLeft);
+  const socialCoord = socialTotal > 0 ? coordFromMasses(lib, auth) : 0;
+  const econCoord = econTotal > 0 ? coordFromMasses(right, left) : 0;
+
+  const socialConf = socialTotal > 0 ? Math.abs(socialCoord) : 0;
+  const econConf = econTotal > 0 ? Math.abs(econCoord) : 0;
+  const overall = clamp((socialConf + econConf) / 2, 0, 1);
 
   return {
     axis_strengths: {
-      social: { libertarian: sLib, authoritarian: sAuth, total: socialTotal },
-      economic: { left: eLeft, right: eRight, total: econTotal },
+      social: { libertarian: lib, authoritarian: auth, total: socialTotal },
+      economic: { left, right, total: econTotal },
     },
     coordinates: { social: socialCoord, economic: econCoord },
-    confidence_2d: { social: 0.5, economic: 0.5, overall: 0.5 },
+    confidence_2d: { social: socialConf, economic: econConf, overall },
     quadrant: buildQuadrantFromCoords(socialCoord, econCoord),
   };
 };
+
+// FIXED: This function now properly trusts backend counts when available
+const normalizeAnalysisSummary = (summaryObj, { segments = [], keyStatements = [], argumentUnits = [] } = {}) => {
+  const s = (summaryObj && typeof summaryObj === "object" ? summaryObj : {}) || {};
+  const countsFromSegments = computeFamilyCounts(segments);
+
+  const countsRaw = s.evidence_counts || s.statement_counts_by_family_ideology || {};
+  const countsFromBackend = {
+    [LIB]: safeNum(countsRaw?.[LIB], 0),
+    [AUTH]: safeNum(countsRaw?.[AUTH], 0),
+    [ECON_LEFT]: safeNum(countsRaw?.[ECON_LEFT], 0),
+    [ECON_RIGHT]: safeNum(countsRaw?.[ECON_RIGHT], 0),
+  };
+
+  // ✅ Trust backend if it has any counts, otherwise compute from segments
+  const backendTotal = Object.values(countsFromBackend).reduce((a, b) => a + safeNum(b, 0), 0);
+  const evidence_counts = backendTotal > 0 ? countsFromBackend : countsFromSegments;
+
+  const total_evidence = Object.values(evidence_counts).reduce((a, b) => a + safeNum(b, 0), 0);
+
+  return {
+    ...s,
+    evidence_counts,
+    total_evidence: Math.max(0, safeNum(s.total_evidence, total_evidence)),
+    avg_confidence_score: clamp(safeNum(s.avg_confidence_score, 0), 0, 1),
+    avg_signal_strength: clamp(safeNum(s.avg_signal_strength, 0), 0, 100),
+    key_statement_count: safeNum(s.key_statement_count, Array.isArray(keyStatements) ? keyStatements.length : 0),
+    argument_unit_count: safeNum(s.argument_unit_count, Array.isArray(argumentUnits) ? argumentUnits.length : 0),
+    pivot_unit_count: safeNum(
+      s.pivot_unit_count,
+      Array.isArray(argumentUnits) ? argumentUnits.filter((u) => Boolean(u?.pivot_detected)).length : 0
+    ),
+    marpor_codes: Array.isArray(s.marpor_codes) ? s.marpor_codes : [],
+  };
+};
+
+const extractAnalysisSummary = (analysisRoot, ctx = {}) => {
+  const root = getAnalysisRoot(analysisRoot);
+  if (!root) return null;
+  if (root.analysis_summary && typeof root.analysis_summary === "object") {
+    return normalizeAnalysisSummary(root.analysis_summary, ctx);
+  }
+
+  // fallback: compute from evidence items
+  const segments = Array.isArray(ctx.segments) ? ctx.segments : [];
+  const keyStatements = Array.isArray(ctx.keyStatements) ? ctx.keyStatements : [];
+  const argumentUnits = Array.isArray(ctx.argumentUnits) ? ctx.argumentUnits : [];
+
+  const counts = computeFamilyCounts(segments);
+  const total_evidence = Object.values(counts).reduce((a, b) => a + safeNum(b, 0), 0);
+
+  const all = dedupeEvidence(segments);
+  let wConfNum = 0;
+  let wSigNum = 0;
+  let wDen = 0;
+  const marpor = new Set();
+
+  for (const it of all) {
+    const w = 1;
+    wConfNum += clamp(safeNum(it.confidence_score, 0), 0, 1) * w;
+    wSigNum += clamp(safeNum(it.signal_strength, 0), 0, 100) * w;
+    wDen += w;
+
+    for (const c of Array.isArray(it.marpor_codes) ? it.marpor_codes : []) {
+      const cs = String(c || "").trim();
+      if (cs) marpor.add(cs);
+    }
+  }
+
+  return {
+    evidence_counts: counts,
+    total_evidence,
+    avg_confidence_score: wDen > 0 ? wConfNum / wDen : 0,
+    avg_signal_strength: wDen > 0 ? wSigNum / wDen : 0,
+    key_statement_count: keyStatements.length,
+    argument_unit_count: argumentUnits.length,
+    pivot_unit_count: argumentUnits.filter((u) => Boolean(u?.pivot_detected)).length,
+    marpor_codes: Array.from(marpor),
+  };
+};
+
+const formatQuadrantLabel = (name) => String(name || "").replaceAll("-", " ").trim();
 
 const getFamilyConfig = (family) => {
   const fam = normalizeFamily(family);
@@ -769,7 +585,6 @@ const getFamilyConfig = (family) => {
       description: "Markets, enterprise",
     },
   };
-
   return (
     configs[fam] || {
       color: COLORS.data.neutral,
@@ -843,16 +658,97 @@ const getQuadrantConfig = (name) => {
   return configs[name] || configs[""];
 };
 
+/* --------------------------- API “safe” calls --------------------------- */
+
+async function getSpeechSafe(speechId) {
+  const id = encodeURIComponent(String(speechId));
+  const candidates = [`/api/speeches/${id}`, `/api/speeches/${id}/detail`, `/api/speech/${id}`, `/api/speeches?id=${id}`];
+  let lastErr = null;
+
+  for (const url of candidates) {
+    try {
+      const res = await apiClient.get(url);
+      return unwrapResponse(res.data);
+    } catch (e) {
+      lastErr = e;
+      const st = e?.response?.status;
+      if (st && st !== 404 && st !== 405) break;
+    }
+  }
+
+  throw new Error(extractBackendMessage(lastErr) || lastErr?.message || "Failed to load speech.");
+}
+
+async function getSpeechFullSafe(speechId) {
+  const id = encodeURIComponent(String(speechId));
+  const candidates = [`/api/speeches/${id}/full`, `/api/speeches/${id}/full_text`, `/api/speeches/${id}/transcript`, `/api/speeches/${id}?full=1`];
+
+  let lastErr = null;
+  for (const url of candidates) {
+    try {
+      const res = await apiClient.get(url);
+      return unwrapResponse(res.data);
+    } catch (e) {
+      lastErr = e;
+      const st = e?.response?.status;
+      if (st && st !== 404 && st !== 405) break;
+    }
+  }
+
+  // fallback
+  return getSpeechSafe(speechId);
+}
+
+async function generateQuestionsSafe(speechId, { question_type = "journalistic", max_questions = 5 } = {}) {
+  const id = encodeURIComponent(String(speechId));
+  const sid = Number(speechId);
+  const payload = { ...(Number.isFinite(sid) ? { speech_id: sid } : {}), question_type, max_questions };
+
+  const candidates = [
+    { method: "post", url: `/api/speeches/${id}/questions/generate` },
+    { method: "post", url: `/api/speeches/${id}/questions` },
+    { method: "post", url: `/api/questions/generate` },
+    { method: "post", url: `/api/generate_questions` },
+  ];
+
+  let lastErr = null;
+  for (const c of candidates) {
+    try {
+      const res = await apiClient[c.method](c.url, payload);
+      return unwrapResponse(res.data);
+    } catch (e) {
+      lastErr = e;
+      const st = e?.response?.status;
+      if (st && st !== 404 && st !== 405) break;
+    }
+  }
+
+  throw new Error(extractBackendMessage(lastErr) || lastErr?.message || "Failed to generate questions.");
+}
+
+async function reanalyzeSpeechSafe(speechId, { force = true } = {}) {
+  const id = encodeURIComponent(String(speechId));
+  const url = force ? `/api/speeches/${id}/analyze?force=true` : `/api/speeches/${id}/analyze`;
+
+  try {
+    const res = await apiClient.post(url); // FastAPI endpoint has no body
+    return unwrapResponse(res.data);
+  } catch (e) {
+    const st = e?.response?.status;
+    if (st === 404 || st === 405) return null;
+    throw new Error(extractBackendMessage(e) || e?.message || "Failed to re-analyze.");
+  }
+}
+
+/* ----------------------------- UI Primitives ----------------------------- */
+
 const GlassCard = ({ children, className = "", hover = false, onClick }) => {
   const [isHovered, setIsHovered] = useState(false);
   return (
     <div
-      className={`relative overflow-hidden rounded-2xl transition-all duration-500 ${className} ${
-        hover && isHovered ? "scale-[1.01]" : ""
-      }`}
+      className={`relative overflow-hidden rounded-2xl transition-all duration-500 ${className} ${hover && isHovered ? "scale-[1.01]" : ""}`}
       style={{
-        background:
-          "linear-gradient(135deg,rgba(255,255,255,0.05) 0%,rgba(255,255,255,0.02) 50%,rgba(0,0,0,0.12) 100%)",
+        background: "linear-gradient(135deg,rgba(255,255,255,0.05) 0%,rgba(255,255,255,0.02) 50%,rgba(0,0,0,0.12) 100%)",
         backdropFilter: "blur(18px)",
         border: `1px solid ${COLORS.glass.border}`,
         boxShadow: "0 10px 35px rgba(0,0,0,0.25)",
@@ -862,6 +758,13 @@ const GlassCard = ({ children, className = "", hover = false, onClick }) => {
       onClick={onClick}
       role={onClick ? "button" : "region"}
       tabIndex={onClick ? 0 : undefined}
+      onKeyDown={(e) => {
+        if (!onClick) return;
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick();
+        }
+      }}
     >
       {children}
     </div>
@@ -895,7 +798,7 @@ const ProgressBar = ({ value, max = 100, color = COLORS.primary.main, showLabel 
           }}
         />
       </div>
-      {showLabel && (
+      {showLabel ? (
         <div className="flex justify-between text-[11px] text-gray-400">
           <span>0%</span>
           <span className="font-bold" style={{ color }}>
@@ -903,7 +806,7 @@ const ProgressBar = ({ value, max = 100, color = COLORS.primary.main, showLabel 
           </span>
           <span>100%</span>
         </div>
-      )}
+      ) : null}
     </div>
   );
 };
@@ -916,10 +819,7 @@ const StatCard = ({ title, value, subtitle, icon: Icon, color = COLORS.primary.m
         <p className="text-2xl font-extrabold text-white">{value}</p>
         {subtitle ? <p className="text-xs text-gray-500 mt-1">{subtitle}</p> : null}
       </div>
-      <div
-        className="p-2.5 rounded-xl"
-        style={{ background: `linear-gradient(135deg,${color}20,${color}10)`, border: `1px solid ${color}35` }}
-      >
+      <div className="p-2.5 rounded-xl" style={{ background: `linear-gradient(135deg,${color}20,${color}10)`, border: `1px solid ${color}35` }}>
         <Icon className="w-5 h-5" style={{ color }} />
       </div>
     </div>
@@ -940,11 +840,7 @@ const ModalShell = ({ open, title, icon: Icon, onClose, children }) => {
               </div>
               <p className="text-white font-extrabold">{title}</p>
             </div>
-            <button
-              onClick={onClose}
-              className="p-2 rounded-xl hover:bg-white/5 text-gray-300 hover:text-white transition"
-              type="button"
-            >
+            <button onClick={onClose} className="p-2 rounded-xl hover:bg-white/5 text-gray-300 hover:text-white transition" type="button">
               <X className="w-5 h-5" />
             </button>
           </div>
@@ -1011,6 +907,8 @@ const ErrorScreen = ({ error, onBack }) => (
   </div>
 );
 
+/* ----------------------------- UI Pieces ----------------------------- */
+
 const AnalysisHeader = ({ speech, onBack, onExport, onSettings, onReanalyze, isReanalyzing }) => {
   const [isScrolled, setIsScrolled] = useState(false);
   useEffect(() => {
@@ -1022,9 +920,7 @@ const AnalysisHeader = ({ speech, onBack, onExport, onSettings, onReanalyze, isR
   return (
     <div
       className={`sticky top-0 z-50 transition-all duration-500 ${
-        isScrolled
-          ? "bg-gray-900/95 backdrop-blur-2xl border-b border-gray-800/50 shadow-2xl"
-          : "bg-gradient-to-b from-gray-950 to-gray-950/95"
+        isScrolled ? "bg-gray-900/95 backdrop-blur-2xl border-b border-gray-800/50 shadow-2xl" : "bg-gradient-to-b from-gray-950 to-gray-950/95"
       }`}
     >
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
@@ -1070,9 +966,7 @@ const AnalysisHeader = ({ speech, onBack, onExport, onSettings, onReanalyze, isR
                 onClick={onReanalyze}
                 disabled={isReanalyzing}
                 className={`p-2.5 rounded-xl transition-all ${
-                  isReanalyzing
-                    ? "bg-cyan-600/20 text-cyan-300"
-                    : "text-gray-400 hover:text-white hover:bg-gray-800/50"
+                  isReanalyzing ? "bg-cyan-600/20 text-cyan-300" : "text-gray-400 hover:text-white hover:bg-gray-800/50"
                 }`}
                 type="button"
                 title="Re-analyze"
@@ -1109,34 +1003,16 @@ const AnalysisSummaryStats = ({ summary, keyStatements }) => {
   return (
     <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
       <StatCard title="Total Evidence" value={summary.total_evidence ?? 0} subtitle="Evidence units" icon={Database} color={COLORS.primary.main} />
-      <StatCard
-        title="Key Statements"
-        value={summary.key_statement_count ?? (keyStatements?.length || 0)}
-        subtitle="High signal"
-        icon={Sparkles}
-        color={COLORS.warning.main}
-      />
+      <StatCard title="Key Statements" value={summary.key_statement_count ?? (keyStatements?.length || 0)} subtitle="High signal" icon={Sparkles} color={COLORS.warning.main} />
       <StatCard
         title="Avg Confidence"
         value={`${Math.round((summary.avg_confidence_score ?? 0) * 100)}%`}
         subtitle={confidenceTierText(summary.avg_confidence_score)}
-        icon={TargetIcon}
+        icon={Target}
         color={getConfidenceColor(summary.avg_confidence_score)}
       />
-      <StatCard
-        title="Avg Signal"
-        value={`${Math.round(summary.avg_signal_strength ?? 0)}%`}
-        subtitle="Signal strength"
-        icon={Zap}
-        color={COLORS.success.main}
-      />
-      <StatCard
-        title="MARPOR Codes"
-        value={summary.marpor_codes?.length ?? 0}
-        subtitle="Unique codes"
-        icon={Code}
-        color={COLORS.warning.light}
-      />
+      <StatCard title="Avg Signal" value={`${Math.round(summary.avg_signal_strength ?? 0)}%`} subtitle="Signal strength" icon={Zap} color={COLORS.success.main} />
+      <StatCard title="MARPOR Codes" value={summary.marpor_codes?.length ?? 0} subtitle="Unique codes" icon={Code} color={COLORS.warning.light} />
     </div>
   );
 };
@@ -1154,14 +1030,16 @@ const PoliticalMap = ({ ideology2d, animationsEnabled = true }) => {
   const intensity = Math.sqrt(x * x + y * y);
   const radius = 16 + intensity * 24;
 
-  const getQColor = () => {
-    if (x > 0 && y > 0) return COLORS.data.libertarian;
-    if (x < 0 && y > 0) return COLORS.data.left;
-    if (x > 0 && y < 0) return COLORS.data.right;
-    if (x < 0 && y < 0) return COLORS.data.authoritarian;
-    return COLORS.neutral[500];
-  };
-  const qColor = getQColor();
+  const qColor =
+    x > 0 && y > 0
+      ? COLORS.data.libertarian
+      : x < 0 && y > 0
+      ? COLORS.data.left
+      : x > 0 && y < 0
+      ? COLORS.data.right
+      : x < 0 && y < 0
+      ? COLORS.data.authoritarian
+      : COLORS.neutral[500];
 
   return (
     <GlassCard className="p-6">
@@ -1178,63 +1056,44 @@ const PoliticalMap = ({ ideology2d, animationsEnabled = true }) => {
 
       <div className="relative aspect-square mb-6">
         <div className="absolute inset-0 rounded-xl bg-gradient-to-br from-gray-900/40 to-gray-800/30 border border-gray-700/30 overflow-hidden">
-          
           <div className="absolute left-1/2 top-0 bottom-0 w-px bg-gradient-to-b from-gray-600/50 via-gray-500/30 to-transparent" />
           <div className="absolute top-1/2 left-0 right-0 h-px bg-gradient-to-r from-gray-600/50 via-gray-500/30 to-transparent" />
 
-          
           <div className="absolute left-1/2 top-2 -translate-x-1/2">
-            <div
-              className="flex items-center gap-1 px-2 py-1 rounded-lg"
-              style={{ background: "rgba(0,212,170,0.10)", border: "1px solid rgba(0,212,170,0.22)" }}
-            >
+            <div className="flex items-center gap-1 px-2 py-1 rounded-lg" style={{ background: "rgba(0,212,170,0.10)", border: "1px solid rgba(0,212,170,0.22)" }}>
               <Shield className="w-3 h-3 text-teal-300" />
               <span className="text-[10px] font-extrabold text-teal-200">LIB</span>
             </div>
           </div>
 
           <div className="absolute left-1/2 bottom-2 -translate-x-1/2">
-            <div
-              className="flex items-center gap-1 px-2 py-1 rounded-lg"
-              style={{ background: "rgba(255,82,82,0.10)", border: "1px solid rgba(255,82,82,0.22)" }}
-            >
+            <div className="flex items-center gap-1 px-2 py-1 rounded-lg" style={{ background: "rgba(255,82,82,0.10)", border: "1px solid rgba(255,82,82,0.22)" }}>
               <Lock className="w-3 h-3 text-red-300" />
               <span className="text-[10px] font-extrabold text-red-200">AUTH</span>
             </div>
           </div>
 
           <div className="absolute left-2 top-1/2 -translate-y-1/2">
-            <div
-              className="flex items-center gap-1 px-2 py-1 rounded-lg"
-              style={{ background: "rgba(0,150,255,0.10)", border: "1px solid rgba(0,150,255,0.22)" }}
-            >
+            <div className="flex items-center gap-1 px-2 py-1 rounded-lg" style={{ background: "rgba(0,150,255,0.10)", border: "1px solid rgba(0,150,255,0.22)" }}>
               <TrendingUp className="w-3 h-3 text-blue-300" />
               <span className="text-[10px] font-extrabold text-blue-200">LEFT</span>
             </div>
           </div>
 
           <div className="absolute right-2 top-1/2 -translate-y-1/2">
-            <div
-              className="flex items-center gap-1 px-2 py-1 rounded-lg"
-              style={{ background: "rgba(255,171,0,0.10)", border: "1px solid rgba(255,171,0,0.22)" }}
-            >
+            <div className="flex items-center gap-1 px-2 py-1 rounded-lg" style={{ background: "rgba(255,171,0,0.10)", border: "1px solid rgba(255,171,0,0.22)" }}>
               <DollarSign className="w-3 h-3 text-amber-300" />
               <span className="text-[10px] font-extrabold text-amber-200">RIGHT</span>
             </div>
           </div>
 
-          
           <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2">
             <div className="w-4 h-4 rounded-full border-2 border-gray-500/30 bg-gray-900/50 flex items-center justify-center">
               <div className="w-1 h-1 rounded-full bg-gray-400" />
             </div>
           </div>
 
-          
-          <div
-            className="absolute z-10 transition-all duration-1000 ease-out"
-            style={{ left: `${leftPct}%`, top: `${topPct}%`, transform: "translate(-50%, -50%)" }}
-          >
+          <div className="absolute z-10 transition-all duration-1000 ease-out" style={{ left: `${leftPct}%`, top: `${topPct}%`, transform: "translate(-50%, -50%)" }}>
             {animationsEnabled ? (
               <div
                 className="absolute inset-0 rounded-full animate-ping"
@@ -1260,7 +1119,7 @@ const PoliticalMap = ({ ideology2d, animationsEnabled = true }) => {
                   boxShadow: `0 0 ${20 + confidence * 40}px ${qColor}50`,
                 }}
               >
-                <TargetIcon className="w-3 h-3 text-white/90" />
+                <Target className="w-3 h-3 text-white/90" />
               </div>
             </div>
           </div>
@@ -1287,8 +1146,7 @@ const PoliticalMap = ({ ideology2d, animationsEnabled = true }) => {
   );
 };
 
-const DominantClassificationCard = ({ overview, showMap = true, animationsEnabled = true }) => {
-  const ideology2d = overview?.ideology_2d || null;
+const DominantClassificationCard = ({ ideology2d, showMap = true, animationsEnabled = true }) => {
   const quadrant = ideology2d?.quadrant || {};
   const axisStrengths = ideology2d?.axis_strengths || {};
   const confidence = ideology2d?.confidence_2d || {};
@@ -1298,6 +1156,12 @@ const DominantClassificationCard = ({ overview, showMap = true, animationsEnable
 
   const social = axisSplit(axisStrengths.social?.authoritarian, axisStrengths.social?.libertarian);
   const economic = axisSplit(axisStrengths.economic?.left, axisStrengths.economic?.right);
+
+  const totalEvidence = social.total + economic.total;
+  const libPctOfTotal = totalEvidence > 0 ? (social.b / totalEvidence) * 100 : 0;
+  const authPctOfTotal = totalEvidence > 0 ? (social.a / totalEvidence) * 100 : 0;
+  const leftPctOfTotal = totalEvidence > 0 ? (economic.a / totalEvidence) * 100 : 0;
+  const rightPctOfTotal = totalEvidence > 0 ? (economic.b / totalEvidence) * 100 : 0;
 
   const socialConf = clamp(safeNum(confidence.social, 0), 0, 1);
   const econConf = clamp(safeNum(confidence.economic, 0), 0, 1);
@@ -1314,7 +1178,7 @@ const DominantClassificationCard = ({ overview, showMap = true, animationsEnable
           </div>
           <div>
             <h1 className="text-2xl font-extrabold text-white">Ideology Classification</h1>
-            <p className="text-gray-400">2D positioning + evidence breakdown</p>
+            <p className="text-gray-400">2D positioning & evidence breakdown</p>
           </div>
         </div>
       </div>
@@ -1329,9 +1193,7 @@ const DominantClassificationCard = ({ overview, showMap = true, animationsEnable
                 </div>
                 <div>
                   <p className="text-sm text-gray-400">Dominant Position</p>
-                  <h2 className="text-2xl font-extrabold text-white mt-1">
-                    {formatQuadrantLabel(quadrant.name) || "No signal"}
-                  </h2>
+                  <h2 className="text-2xl font-extrabold text-white mt-1">{formatQuadrantLabel(quadrant.name) || "No signal"}</h2>
                   <div className="flex items-center gap-2 mt-2 flex-wrap">
                     <GradientBadge color={COLORS.primary.main}>{quadrant.intensity || "Minimal"}</GradientBadge>
                     <span className="text-xs text-gray-400">Magnitude: {safeNum(quadrant.magnitude, 0).toFixed(2)}</span>
@@ -1339,6 +1201,12 @@ const DominantClassificationCard = ({ overview, showMap = true, animationsEnable
                       <span className="text-xs text-amber-300 inline-flex items-center gap-1">
                         <Info className="w-3 h-3" />
                         No economic evidence
+                      </span>
+                    ) : null}
+                    {social.total <= 0 ? (
+                      <span className="text-xs text-amber-300 inline-flex items-center gap-1">
+                        <Info className="w-3 h-3" />
+                        No social evidence
                       </span>
                     ) : null}
                   </div>
@@ -1358,14 +1226,14 @@ const DominantClassificationCard = ({ overview, showMap = true, animationsEnable
                 <div className="space-y-3">
                   <div className="flex justify-between text-sm">
                     <span className="text-gray-400">Authoritarian</span>
-                    <span className="font-extrabold text-white">{social.aPct.toFixed(1)}%</span>
+                    <span className="font-extrabold text-white">{authPctOfTotal.toFixed(1)}%</span>
                   </div>
-                  <ProgressBar value={social.aPct} color={COLORS.data.authoritarian} showLabel={false} />
+                  <ProgressBar value={authPctOfTotal} color={COLORS.data.authoritarian} showLabel={false} />
                   <div className="flex justify-between text-sm">
                     <span className="text-gray-400">Libertarian</span>
-                    <span className="font-extrabold text-white">{social.bPct.toFixed(1)}%</span>
+                    <span className="font-extrabold text-white">{libPctOfTotal.toFixed(1)}%</span>
                   </div>
-                  <ProgressBar value={social.bPct} color={COLORS.data.libertarian} showLabel={false} />
+                  <ProgressBar value={libPctOfTotal} color={COLORS.data.libertarian} showLabel={false} />
                 </div>
               </div>
 
@@ -1380,34 +1248,22 @@ const DominantClassificationCard = ({ overview, showMap = true, animationsEnable
                 <div className="space-y-3">
                   <div className="flex justify-between text-sm">
                     <span className="text-gray-400">Left</span>
-                    <span className="font-extrabold text-white">{economic.aPct.toFixed(1)}%</span>
+                    <span className="font-extrabold text-white">{leftPctOfTotal.toFixed(1)}%</span>
                   </div>
-                  <ProgressBar value={economic.aPct} color={COLORS.data.left} showLabel={false} />
+                  <ProgressBar value={leftPctOfTotal} color={COLORS.data.left} showLabel={false} />
                   <div className="flex justify-between text-sm">
                     <span className="text-gray-400">Right</span>
-                    <span className="font-extrabold text-white">{economic.bPct.toFixed(1)}%</span>
+                    <span className="font-extrabold text-white">{rightPctOfTotal.toFixed(1)}%</span>
                   </div>
-                  <ProgressBar value={economic.bPct} color={COLORS.data.right} showLabel={false} />
+                  <ProgressBar value={rightPctOfTotal} color={COLORS.data.right} showLabel={false} />
                 </div>
               </div>
             </div>
           </GlassCard>
 
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            <StatCard
-              title="Social Confidence"
-              value={`${Math.round(socialConf * 100)}%`}
-              subtitle={confidenceTierText(socialConf)}
-              icon={Shield}
-              color={getConfidenceColor(socialConf)}
-            />
-            <StatCard
-              title="Economic Confidence"
-              value={`${Math.round(econConf * 100)}%`}
-              subtitle={confidenceTierText(econConf)}
-              icon={DollarSign}
-              color={getConfidenceColor(econConf)}
-            />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <StatCard title="Social Confidence" value={`${Math.round(socialConf * 100)}%`} subtitle={confidenceTierText(socialConf)} icon={Shield} color={getConfidenceColor(socialConf)} />
+            <StatCard title="Economic Confidence" value={`${Math.round(econConf * 100)}%`} subtitle={confidenceTierText(econConf)} icon={DollarSign} color={getConfidenceColor(econConf)} />
           </div>
         </div>
 
@@ -1417,10 +1273,223 @@ const DominantClassificationCard = ({ overview, showMap = true, animationsEnable
   );
 };
 
-const EvidenceDistribution = ({ overview, segments, activeFilter, setActiveFilter }) => {
+const MarporChips = ({ codes }) => {
+  const arr = Array.isArray(codes) ? codes.map((c) => String(c || "").trim()).filter(Boolean) : [];
+  if (!arr.length) return null;
+  return (
+    <div className="flex flex-wrap gap-2 mt-2">
+      {arr.slice(0, 10).map((c) => (
+        <span
+          key={c}
+          className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-extrabold tracking-wide uppercase"
+          style={{
+            background: "rgba(255,255,255,0.06)",
+            border: "1px solid rgba(255,255,255,0.10)",
+            color: "rgba(255,255,255,0.80)",
+          }}
+          title="MARPOR code"
+        >
+          <Code className="w-3 h-3 text-gray-300" />
+          {c}
+        </span>
+      ))}
+      {arr.length > 10 ? <span className="text-[10px] text-gray-500 ml-1">+{arr.length - 10}</span> : null}
+    </div>
+  );
+};
+
+const ContextToggle = ({ open, onToggle }) => (
+  <button
+    onClick={onToggle}
+    className="px-2 py-1 rounded-lg bg-gray-800/50 hover:bg-gray-700/50 border border-gray-700/50 text-xs font-extrabold text-gray-200 inline-flex items-center gap-2 transition"
+    type="button"
+    title="Show context before/after"
+  >
+    <Info className="w-4 h-4 text-gray-300" />
+    Context
+    {open ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+  </button>
+);
+
+const EvidenceList = ({
+  title,
+  icon: TitleIcon,
+  items,
+  activeFilter,
+  onClearFilter,
+  onJumpToTime,
+  transcriptText,
+  searchable = false,
+  prefix = "Item",
+}) => {
+  const [searchQ, setSearchQ] = useState("");
+  const [openCtx, setOpenCtx] = useState(() => new Set());
+
+  const filtered = useMemo(() => {
+    let arr = Array.isArray(items) ? items : [];
+    if (activeFilter) arr = arr.filter((s) => normalizeFamily(s.ideology_family) === activeFilter);
+    if (searchable && searchQ.trim()) {
+      const q = searchQ.toLowerCase();
+      arr = arr.filter((s) => String(s.text || s.full_text || "").toLowerCase().includes(q));
+    }
+    return arr;
+  }, [items, activeFilter, searchable, searchQ]);
+
+  const toggleCtx = (key) => {
+    setOpenCtx((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  return (
+    <GlassCard className="h-full flex flex-col">
+      <div className="p-6 border-b border-gray-700/50">
+        <div className="flex items-center justify-between gap-4 flex-wrap">
+          <div className="flex items-center gap-3">
+            <div className="p-3 bg-gradient-to-br from-cyan-500/10 to-blue-500/10 rounded-xl border border-cyan-500/20">
+              <TitleIcon className="w-5 h-5 text-cyan-400" />
+            </div>
+            <div>
+              <h3 className="text-lg font-extrabold text-white">{title}</h3>
+              <p className="text-sm text-gray-400 mt-1">{filtered.length} items</p>
+            </div>
+          </div>
+
+          {activeFilter ? (
+            <button
+              onClick={onClearFilter}
+              className="px-4 py-2 bg-gray-800/50 hover:bg-gray-700/50 text-gray-300 hover:text-white rounded-xl border border-gray-700/50 transition-all flex items-center gap-2"
+              type="button"
+            >
+              <X className="w-4 h-4" />
+              Clear Filter
+            </button>
+          ) : null}
+        </div>
+
+        {searchable ? (
+          <div className="mt-4 relative">
+            <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-500" />
+            <input
+              type="text"
+              placeholder="Search…"
+              value={searchQ}
+              onChange={(e) => setSearchQ(e.target.value)}
+              className="w-full pl-12 pr-10 py-3 bg-gray-900/50 border border-gray-700/50 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyan-500/40 transition-all"
+            />
+            {searchQ ? (
+              <button
+                onClick={() => setSearchQ("")}
+                className="absolute right-3 top-1/2 -translate-y-1/2 p-2 text-gray-500 hover:text-gray-300"
+                type="button"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+
+      <div className="p-6 space-y-3 overflow-y-auto max-h-[700px]">
+        {filtered.length ? (
+          filtered.map((it, idx) => {
+            const cfg = getFamilyConfig(it.ideology_family);
+            const Icon = cfg.icon;
+            const key = stableItemKey(it);
+            const ctxOpen = openCtx.has(key);
+            const ctx = getContextForItem(it, transcriptText);
+
+            return (
+              <div key={key || idx} className="p-4 rounded-xl border border-gray-700/30 bg-gray-900/20 hover:border-gray-600/50 transition">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap mb-2">
+                    <div className="px-2 py-1 rounded bg-gray-800/60 border border-gray-700/50 text-xs font-extrabold text-white">
+                      {prefix} {idx + 1}
+                    </div>
+
+                    <div className="px-2 py-1 rounded flex items-center gap-2" style={{ background: cfg.lightColor, border: `1px solid ${cfg.color}30` }}>
+                      <Icon className="w-3 h-3" style={{ color: cfg.color }} />
+                      <span className="text-xs font-extrabold" style={{ color: cfg.color }}>
+                        {cfg.name}
+                      </span>
+                    </div>
+
+                    {it.confidence_score > 0 ? (
+                      <div className="px-2 py-1 rounded bg-gray-800/50 border border-gray-700/50 text-xs font-extrabold text-gray-200">
+                        {Math.round(it.confidence_score * 100)}% conf
+                      </div>
+                    ) : null}
+
+                    {it.time_begin !== null ? (
+                      <button
+                        className="px-2 py-1 rounded bg-gray-800/50 border border-gray-700/50 text-xs font-semibold text-gray-200 hover:bg-gray-700/50 transition inline-flex items-center gap-1"
+                        type="button"
+                        onClick={() => onJumpToTime && onJumpToTime(it.time_begin)}
+                      >
+                        <PlayCircle className="w-3 h-3" />
+                        {formatClock(it.time_begin)}
+                      </button>
+                    ) : null}
+                  </div>
+
+                  <p className="text-sm text-gray-200 leading-relaxed">{it.text || it.full_text}</p>
+
+                  <MarporChips codes={it.marpor_codes} />
+
+                  {ctx.before || ctx.after ? (
+                    <div className="mt-3">
+                      <ContextToggle open={ctxOpen} onToggle={() => toggleCtx(key)} />
+                      {ctxOpen ? (
+                        <div className="mt-3 space-y-2">
+                          {ctx.before ? (
+                            <div className="p-3 rounded-xl bg-gray-900/35 border border-gray-700/30">
+                              <p className="text-[11px] font-extrabold text-gray-400 mb-1">Before</p>
+                              <p className="text-sm text-gray-300 whitespace-pre-wrap">{ctx.before}</p>
+                            </div>
+                          ) : null}
+                          {ctx.after ? (
+                            <div className="p-3 rounded-xl bg-gray-900/35 border border-gray-700/30">
+                              <p className="text-[11px] font-extrabold text-gray-400 mb-1">After</p>
+                              <p className="text-sm text-gray-300 whitespace-pre-wrap">{ctx.after}</p>
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            );
+          })
+        ) : (
+          <div className="text-center py-10">
+            <MessageSquare className="w-12 h-12 text-gray-700 mx-auto mb-3" />
+            <p className="text-gray-500">No items.</p>
+          </div>
+        )}
+      </div>
+    </GlassCard>
+  );
+};
+
+const EvidenceDistribution = ({ summary, segments, activeFilter, setActiveFilter, ideology2d }) => {
   const [expandedFamily, setExpandedFamily] = useState(null);
-  const evidenceCounts = overview?.evidence_counts || {};
-  const totalEvidence = safeNum(overview?.total_evidence, 0);
+  
+  const useAxisStrengths = ideology2d?.axis_strengths && typeof ideology2d.axis_strengths === 'object';
+  
+  const evidenceCounts = useAxisStrengths 
+    ? {
+        [LIB]: safeNum(ideology2d.axis_strengths.social?.libertarian, 0),
+        [AUTH]: safeNum(ideology2d.axis_strengths.social?.authoritarian, 0),
+        [ECON_LEFT]: safeNum(ideology2d.axis_strengths.economic?.left, 0),
+        [ECON_RIGHT]: safeNum(ideology2d.axis_strengths.economic?.right, 0),
+      }
+    : summary?.evidence_counts || {};
+    
+  const totalEvidence = Object.values(evidenceCounts).reduce((a, b) => a + safeNum(b, 0), 0);
   const families = [LIB, AUTH, ECON_LEFT, ECON_RIGHT];
 
   const familyData = useMemo(() => {
@@ -1429,15 +1498,39 @@ const EvidenceDistribution = ({ overview, segments, activeFilter, setActiveFilte
         const config = getFamilyConfig(family);
         const count = safeNum(evidenceCounts[family], 0);
         const pct = totalEvidence > 0 ? (count / totalEvidence) * 100 : 0;
-
-        const samples = (Array.isArray(segments) ? segments : [])
-          .filter((s) => s?.ideology_family === family)
-          .slice(0, 3);
-
+        
+        // ✅ FIX: Filter samples by axis contribution when using axis_strengths
+        let samples = [];
+        if (useAxisStrengths) {
+          samples = (Array.isArray(segments) ? segments : [])
+            .filter((s) => {
+              if (!s?.ideology_2d?.axis_strengths) return false;
+              
+              const axis = s.ideology_2d.axis_strengths;
+              switch(family) {
+                case LIB:
+                  return safeNum(axis.social?.libertarian, 0) > 0;
+                case AUTH:
+                  return safeNum(axis.social?.authoritarian, 0) > 0;
+                case ECON_LEFT:
+                  return safeNum(axis.economic?.left, 0) > 0;
+                case ECON_RIGHT:
+                  return safeNum(axis.economic?.right, 0) > 0;
+                default:
+                  return false;
+              }
+            })
+            .slice(0, 3);
+        } else {
+          samples = (Array.isArray(segments) ? segments : [])
+            .filter((s) => s?.ideology_family === family)
+            .slice(0, 3);
+        }
+        
         return { family, config, count, pct, samples, isExpanded: expandedFamily === family };
       })
       .sort((a, b) => b.count - a.count);
-  }, [segments, evidenceCounts, totalEvidence, expandedFamily]);
+  }, [segments, evidenceCounts, totalEvidence, expandedFamily, useAxisStrengths]);
 
   return (
     <GlassCard className="p-6">
@@ -1448,14 +1541,18 @@ const EvidenceDistribution = ({ overview, segments, activeFilter, setActiveFilte
           </div>
           <div>
             <h3 className="text-lg font-extrabold text-white">Evidence Distribution</h3>
-            <p className="text-sm text-gray-400 mt-1">By ideology category</p>
+            <p className="text-sm text-gray-400 mt-1">
+              {useAxisStrengths ? 'Weighted axis contributions' : 'By ideology category'}
+            </p>
           </div>
         </div>
 
         <div className="flex items-center gap-3">
           <div className="text-right">
             <p className="text-xs text-gray-500">Total</p>
-            <p className="text-lg font-extrabold text-white">{totalEvidence}</p>
+            <p className="text-lg font-extrabold text-white">
+              {useAxisStrengths ? totalEvidence.toFixed(2) : Math.round(totalEvidence)}
+            </p>
           </div>
           {activeFilter ? (
             <button
@@ -1488,13 +1585,16 @@ const EvidenceDistribution = ({ overview, segments, activeFilter, setActiveFilte
                 onClick={() => setExpandedFamily(isExpanded ? null : family)}
                 role="button"
                 tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setExpandedFamily(isExpanded ? null : family);
+                  }
+                }}
               >
                 <div className="flex items-center justify-between gap-3">
                   <div className="flex items-center gap-3 min-w-0">
-                    <div
-                      className="p-2 rounded-lg border flex-shrink-0"
-                      style={{ background: config.lightColor, borderColor: `${config.color}30` }}
-                    >
+                    <div className="p-2 rounded-lg border flex-shrink-0" style={{ background: config.lightColor, borderColor: `${config.color}30` }}>
                       <Icon className="w-4 h-4" style={{ color: config.color }} />
                     </div>
                     <div className="min-w-0">
@@ -1502,10 +1602,7 @@ const EvidenceDistribution = ({ overview, segments, activeFilter, setActiveFilte
                         <h4 className="font-extrabold" style={{ color: config.color }}>
                           {config.name}
                         </h4>
-                        <span
-                          className="px-2 py-0.5 rounded text-[10px] font-extrabold"
-                          style={{ background: `${config.color}20`, color: config.color }}
-                        >
+                        <span className="px-2 py-0.5 rounded text-[10px] font-extrabold" style={{ background: `${config.color}20`, color: config.color }}>
                           {config.short}
                         </span>
                       </div>
@@ -1515,7 +1612,9 @@ const EvidenceDistribution = ({ overview, segments, activeFilter, setActiveFilte
 
                   <div className="flex items-center gap-4 flex-shrink-0">
                     <div className="text-right">
-                      <p className="text-xl font-extrabold text-white">{count}</p>
+                      <p className="text-xl font-extrabold text-white">
+                        {useAxisStrengths ? count.toFixed(2) : Math.round(count)}
+                      </p>
                       <p className="text-xs text-gray-400">{pct.toFixed(1)}%</p>
                     </div>
                     <ChevronDown className={`w-4 h-4 text-gray-400 transition-transform ${isExpanded ? "rotate-180" : ""}`} />
@@ -1534,16 +1633,22 @@ const EvidenceDistribution = ({ overview, segments, activeFilter, setActiveFilte
                   {count > 0 ? (
                     <div className="space-y-3">
                       <p className="text-sm font-semibold text-gray-300">Sample Evidence</p>
-                      <div className="space-y-2">
-                        {samples.map((item, i) => (
-                          <div key={i} className="p-3 bg-gray-800/20 rounded-lg border border-gray-700/20">
-                            <p className="text-sm text-gray-300 line-clamp-2 italic">"{item.text || item.full_text}"</p>
-                            {item.confidence_score > 0 ? (
-                              <div className="mt-2 text-xs text-gray-500">{Math.round(item.confidence_score * 100)}% conf</div>
-                            ) : null}
-                          </div>
-                        ))}
-                      </div>
+                      {samples.length > 0 ? (
+                        <div className="space-y-2">
+                          {samples.map((item, i) => (
+                            <div key={i} className="p-3 bg-gray-800/20 rounded-lg border border-gray-700/20">
+                              <p className="text-sm text-gray-300 line-clamp-2 italic">"{item.text || item.full_text}"</p>
+                              {item.confidence_score > 0 ? <div className="mt-2 text-xs text-gray-500">{Math.round(item.confidence_score * 100)}% conf</div> : null}
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="p-3 bg-amber-900/10 rounded-lg border border-amber-700/30">
+                          <p className="text-xs text-amber-200">
+                            No segments with {config.name} as dominant label. Score comes from secondary axis contributions in mixed segments.
+                          </p>
+                        </div>
+                      )}
 
                       <button
                         onClick={(e) => {
@@ -1579,6 +1684,8 @@ const EvidenceDistribution = ({ overview, segments, activeFilter, setActiveFilte
   );
 };
 
+
+
 const QuestionGenerator = ({ speechId }) => {
   const [qType, setQType] = useState("journalistic");
   const [numQ, setNumQ] = useState(5);
@@ -1592,14 +1699,10 @@ const QuestionGenerator = ({ speechId }) => {
     setError("");
     setGenerating(true);
     try {
-      const payload = await generateQuestionsSafe(speechId, {
-        question_type: qType,
-        max_questions: clamp(Number(numQ) || 5, 1, 8),
-      });
-
-      const root = getAnalysisRoot(payload) || {};
+      const payload = await generateQuestionsSafe(speechId, { question_type: qType, max_questions: clamp(Number(numQ) || 5, 1, 8) });
+      const root = getAnalysisRoot(payload) || payload || {};
       const qs = root.questions || root.data?.questions || [];
-      setQuestions(Array.isArray(qs) ? qs : []);
+      setQuestions(Array.isArray(qs) ? qs.map((x) => String(x || "").trim()).filter(Boolean) : []);
     } catch (e) {
       setError(String(e?.message || "Failed"));
     } finally {
@@ -1724,9 +1827,7 @@ const QuestionGenerator = ({ speechId }) => {
 
         <div className="flex-1 flex flex-col">
           <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
-            <h4 className="text-sm font-extrabold text-gray-300">
-              Generated Questions{questions.length ? ` (${questions.length})` : ""}
-            </h4>
+            <h4 className="text-sm font-extrabold text-gray-300">Generated Questions{questions.length ? ` (${questions.length})` : ""}</h4>
 
             {questions.length ? (
               <button
@@ -1849,9 +1950,7 @@ const MediaPlayer = ({
     draggingRef.current = true;
     setTimeByClientX(e.clientX);
 
-    const onMove = (ev) => {
-      if (draggingRef.current) setTimeByClientX(ev.clientX);
-    };
+    const onMove = (ev) => draggingRef.current && setTimeByClientX(ev.clientX);
     const onUp = () => {
       draggingRef.current = false;
       window.removeEventListener("pointermove", onMove);
@@ -1900,16 +1999,16 @@ const MediaPlayer = ({
     const ks = Array.isArray(keyStatements) ? keyStatements : [];
     if (!ks.length || !duration) return [];
     const hasTime = ks.some((k) => Number.isFinite(k?.time_begin));
-    if (hasTime) {
-      return ks
-        .map((k, i) => ({
+    const raw = hasTime
+      ? ks.map((k, i) => ({
           idx: i,
           frac: Number.isFinite(k?.time_begin) && k.time_begin >= 0 ? clamp(k.time_begin / duration, 0, 1) : (i + 1) / (ks.length + 1),
         }))
-        .sort((a, b) => a.frac - b.frac)
-        .filter((m, i, arr) => !i || Math.abs(arr[i - 1].frac - m.frac) > 0.01);
-    }
-    return ks.map((_, i) => ({ idx: i, frac: (i + 1) / (ks.length + 1) }));
+      : ks.map((_, i) => ({ idx: i, frac: (i + 1) / (ks.length + 1) }));
+
+    return raw
+      .sort((a, b) => a.frac - b.frac)
+      .filter((m, i, arr) => !i || Math.abs(arr[i - 1].frac - m.frac) > 0.01);
   }, [keyStatements, duration]);
 
   const jumpToFrac = async (frac) => {
@@ -2027,11 +2126,7 @@ const MediaPlayer = ({
           </div>
 
           <div className="flex items-center gap-3">
-            <select
-              value={playbackRate}
-              onChange={(e) => changePlaybackRate(Number(e.target.value))}
-              className="px-3 py-2 bg-gray-800/50 border border-gray-700/50 rounded-lg text-sm text-white hover:border-gray-600/50 transition-colors"
-            >
+            <select value={playbackRate} onChange={(e) => changePlaybackRate(Number(e.target.value))} className="px-3 py-2 bg-gray-800/50 border border-gray-700/50 rounded-lg text-sm text-white hover:border-gray-600/50 transition-colors">
               {[0.5, 0.75, 1, 1.25, 1.5, 2].map((r) => (
                 <option key={r} value={r}>
                   {r}x
@@ -2045,328 +2140,9 @@ const MediaPlayer = ({
   );
 };
 
-const KeyStatements = ({ statements, activeFilter, onClearFilter, onJumpToTime, transcriptText }) => {
-  const [openCtx, setOpenCtx] = useState(() => new Set());
-
-  const filtered = useMemo(() => {
-    const arr = Array.isArray(statements) ? statements : [];
-    if (!activeFilter) return arr;
-    return arr.filter((s) => normalizeFamily(s.ideology_family) === activeFilter);
-  }, [statements, activeFilter]);
-
-  const toggleCtx = (key) => {
-    setOpenCtx((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  };
-
-  return (
-    <GlassCard className="h-full flex flex-col">
-      <div className="p-6 border-b border-gray-700/50">
-        <div className="flex items-center justify-between gap-4 flex-wrap">
-          <div className="flex items-center gap-3">
-            <div className="p-3 bg-gradient-to-br from-cyan-500/10 to-blue-500/10 rounded-xl border border-cyan-500/20">
-              <Sparkles className="w-5 h-5 text-cyan-400" />
-            </div>
-            <div>
-              <h3 className="text-lg font-extrabold text-white">Key Statements</h3>
-              <p className="text-sm text-gray-400 mt-1">{filtered.length} items</p>
-            </div>
-          </div>
-
-          {activeFilter ? (
-            <button
-              onClick={onClearFilter}
-              className="px-4 py-2 bg-gray-800/50 hover:bg-gray-700/50 text-gray-300 hover:text-white rounded-xl border border-gray-700/50 transition-all flex items-center gap-2"
-              type="button"
-            >
-              <X className="w-4 h-4" />
-              Clear Filter
-            </button>
-          ) : null}
-        </div>
-      </div>
-
-      <div className="p-6 space-y-3 overflow-y-auto max-h-[700px]">
-        {filtered.length ? (
-          filtered.map((it, idx) => {
-            const cfg = getFamilyConfig(it.ideology_family);
-            const Icon = cfg.icon;
-
-            const key = stableItemKey(it);
-            const ctxOpen = openCtx.has(key);
-            const ctx = getContextForItem(it, transcriptText);
-
-            return (
-              <div key={key || idx} className="p-4 rounded-xl border border-gray-700/30 bg-gray-900/20 hover:border-gray-600/50 transition">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2 flex-wrap mb-2">
-                      <div className="px-2 py-1 rounded bg-gray-800/60 border border-gray-700/50 text-xs font-extrabold text-white">
-                        K{idx + 1}
-                      </div>
-
-                      <div className="px-2 py-1 rounded flex items-center gap-2" style={{ background: cfg.lightColor, border: `1px solid ${cfg.color}30` }}>
-                        <Icon className="w-3 h-3" style={{ color: cfg.color }} />
-                        <span className="text-xs font-extrabold" style={{ color: cfg.color }}>
-                          {cfg.short}
-                        </span>
-                      </div>
-
-                      {it.confidence_score > 0 ? (
-                        <div className="px-2 py-1 rounded bg-gray-800/50 border border-gray-700/50 text-xs font-extrabold text-gray-200">
-                          {Math.round(it.confidence_score * 100)}% conf
-                        </div>
-                      ) : null}
-
-                      {it.time_begin !== null ? (
-                        <button
-                          className="px-2 py-1 rounded bg-gray-800/50 border border-gray-700/50 text-xs font-semibold text-gray-200 hover:bg-gray-700/50 transition inline-flex items-center gap-1"
-                          type="button"
-                          onClick={() => onJumpToTime && onJumpToTime(it.time_begin)}
-                        >
-                          <PlayCircle className="w-3 h-3" />
-                          {formatClock(it.time_begin)}
-                        </button>
-                      ) : null}
-                    </div>
-
-                    <p className="text-sm text-gray-200 leading-relaxed">{it.text || it.full_text}</p>
-
-                    <MarporChips codes={it.marpor_codes} />
-
-                    {ctx.before || ctx.after ? (
-                      <div className="mt-3">
-                        <ContextToggle open={ctxOpen} onToggle={() => toggleCtx(key)} />
-                        {ctxOpen ? (
-                          <div className="mt-3 space-y-2">
-                            {ctx.before ? (
-                              <div className="p-3 rounded-xl bg-gray-900/35 border border-gray-700/30">
-                                <p className="text-[11px] font-extrabold text-gray-400 mb-1">Before</p>
-                                <p className="text-sm text-gray-300 whitespace-pre-wrap">{ctx.before}</p>
-                              </div>
-                            ) : null}
-                            {ctx.after ? (
-                              <div className="p-3 rounded-xl bg-gray-900/35 border border-gray-700/30">
-                                <p className="text-[11px] font-extrabold text-gray-400 mb-1">After</p>
-                                <p className="text-sm text-gray-300 whitespace-pre-wrap">{ctx.after}</p>
-                              </div>
-                            ) : null}
-                          </div>
-                        ) : null}
-                      </div>
-                    ) : null}
-                  </div>
-                </div>
-              </div>
-            );
-          })
-        ) : (
-          <div className="text-center py-10">
-            <MessageSquare className="w-12 h-12 text-gray-700 mx-auto mb-3" />
-            <p className="text-gray-500">No key statements.</p>
-          </div>
-        )}
-      </div>
-    </GlassCard>
-  );
-};
-
-const EvidenceSegments = ({ segments, activeFilter, onClearFilter, onJumpToTime, transcriptText }) => {
-  const [searchQ, setSearchQ] = useState("");
-  const [openCtx, setOpenCtx] = useState(() => new Set());
-
-  const filtered = useMemo(() => {
-    let arr = Array.isArray(segments) ? segments : [];
-    if (activeFilter) arr = arr.filter((s) => normalizeFamily(s.ideology_family) === activeFilter);
-    if (searchQ.trim()) {
-      const q = searchQ.toLowerCase();
-      arr = arr.filter((s) => String(s.text || s.full_text || "").toLowerCase().includes(q));
-    }
-    return arr;
-  }, [segments, activeFilter, searchQ]);
-
-  const toggleCtx = (key) => {
-    setOpenCtx((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
-  };
-
-  return (
-    <GlassCard className="h-full flex flex-col">
-      <div className="p-6 border-b border-gray-700/50">
-        <div className="flex items-center justify-between gap-4 flex-wrap">
-          <div className="flex items-center gap-3">
-            <div className="p-3 bg-gradient-to-br from-cyan-500/10 to-blue-500/10 rounded-xl border border-cyan-500/20">
-              <Layers className="w-5 h-5 text-cyan-400" />
-            </div>
-            <div>
-              <h3 className="text-lg font-extrabold text-white">Evidence Segments</h3>
-              <p className="text-sm text-gray-400 mt-1">{filtered.length} items</p>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2">
-            {activeFilter ? (
-              <button
-                onClick={onClearFilter}
-                className="px-4 py-2 bg-gray-800/50 hover:bg-gray-700/50 text-gray-300 hover:text-white rounded-xl border border-gray-700/50 transition-all flex items-center gap-2"
-                type="button"
-              >
-                <X className="w-4 h-4" />
-                Clear Filter
-              </button>
-            ) : null}
-          </div>
-        </div>
-
-        <div className="mt-4 relative">
-          <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-500" />
-          <input
-            type="text"
-            placeholder="Search evidence..."
-            value={searchQ}
-            onChange={(e) => setSearchQ(e.target.value)}
-            className="w-full pl-12 pr-10 py-3 bg-gray-900/50 border border-gray-700/50 rounded-xl text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyan-500/40 transition-all"
-          />
-          {searchQ ? (
-            <button onClick={() => setSearchQ("")} className="absolute right-3 top-1/2 -translate-y-1/2 p-2 text-gray-500 hover:text-gray-300" type="button">
-              <X className="w-5 h-5" />
-            </button>
-          ) : null}
-        </div>
-      </div>
-
-      <div className="p-6 space-y-3 overflow-y-auto max-h-[700px]">
-        {filtered.length ? (
-          filtered.map((it, idx) => {
-            const cfg = getFamilyConfig(it.ideology_family);
-            const Icon = cfg.icon;
-
-            const key = stableItemKey(it);
-            const ctxOpen = openCtx.has(key);
-            const ctx = getContextForItem(it, transcriptText);
-
-            return (
-              <div key={key || idx} className="p-4 rounded-xl border border-gray-700/30 bg-gray-900/20 hover:border-gray-600/50 transition">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2 flex-wrap mb-2">
-                      <div className="px-2 py-1 rounded bg-gray-800/60 border border-gray-700/50 text-xs font-extrabold text-white">#{idx + 1}</div>
-
-                      <div className="px-2 py-1 rounded flex items-center gap-2" style={{ background: cfg.lightColor, border: `1px solid ${cfg.color}30` }}>
-                        <Icon className="w-3 h-3" style={{ color: cfg.color }} />
-                        <span className="text-xs font-extrabold" style={{ color: cfg.color }}>
-                          {cfg.short}
-                        </span>
-                      </div>
-
-                      {it.confidence_score > 0 ? (
-                        <div className="px-2 py-1 rounded bg-gray-800/50 border border-gray-700/50 text-xs font-extrabold text-gray-200">
-                          {Math.round(it.confidence_score * 100)}% conf
-                        </div>
-                      ) : null}
-
-                      {it.time_begin !== null ? (
-                        <button
-                          className="px-2 py-1 rounded bg-gray-800/50 border border-gray-700/50 text-xs font-semibold text-gray-200 hover:bg-gray-700/50 transition inline-flex items-center gap-1"
-                          type="button"
-                          onClick={() => onJumpToTime && onJumpToTime(it.time_begin)}
-                        >
-                          <PlayCircle className="w-3 h-3" />
-                          {formatClock(it.time_begin)}
-                        </button>
-                      ) : null}
-                    </div>
-
-                    <p className="text-sm text-gray-200 leading-relaxed">{it.text || it.full_text}</p>
-
-                    <MarporChips codes={it.marpor_codes} />
-
-                    {ctx.before || ctx.after ? (
-                      <div className="mt-3">
-                        <ContextToggle open={ctxOpen} onToggle={() => toggleCtx(key)} />
-                        {ctxOpen ? (
-                          <div className="mt-3 space-y-2">
-                            {ctx.before ? (
-                              <div className="p-3 rounded-xl bg-gray-900/35 border border-gray-700/30">
-                                <p className="text-[11px] font-extrabold text-gray-400 mb-1">Before</p>
-                                <p className="text-sm text-gray-300 whitespace-pre-wrap">{ctx.before}</p>
-                              </div>
-                            ) : null}
-                            {ctx.after ? (
-                              <div className="p-3 rounded-xl bg-gray-900/35 border border-gray-700/30">
-                                <p className="text-[11px] font-extrabold text-gray-400 mb-1">After</p>
-                                <p className="text-sm text-gray-300 whitespace-pre-wrap">{ctx.after}</p>
-                              </div>
-                            ) : null}
-                          </div>
-                        ) : null}
-                      </div>
-                    ) : null}
-                  </div>
-                </div>
-              </div>
-            );
-          })
-        ) : (
-          <div className="text-center py-10">
-            <Layers className="w-12 h-12 text-gray-700 mx-auto mb-3" />
-            <p className="text-gray-500">No evidence segments.</p>
-          </div>
-        )}
-      </div>
-    </GlassCard>
-  );
-};
-
-const buildOverviewFromAnalysis = (speechData, analysisData) => {
-  const root = getAnalysisRoot(analysisData);
-
-  const extractedSegments = extractSegments(root);
-  const extractedKeyStatements = extractKeyStatements(root);
-  const extractedArgumentUnits = extractArgumentUnits(root);
-
-  const summary = extractAnalysisSummary(root, {
-    segments: extractedSegments,
-    keyStatements: extractedKeyStatements,
-    argumentUnits: extractedArgumentUnits,
-  });
-
-  const evidence_counts = summary?.evidence_counts || { [LIB]: 0, [AUTH]: 0, [ECON_LEFT]: 0, [ECON_RIGHT]: 0 };
-  const total_evidence =
-    safeNum(summary?.total_evidence, 0) > 0
-      ? safeNum(summary.total_evidence, 0)
-      : Object.values(evidence_counts).reduce((a, b) => a + safeNum(b, 0), 0);
-
-  const backend2d = root?.ideology_2d || root?.speech_level?.ideology_2d || root?.metadata?.ideology_2d || null;
-
-  let ideology2d = normalizeIdeology2DFromBackend(backend2d);
-
-  if (!ideology2d && (extractedSegments.length || extractedKeyStatements.length)) {
-    ideology2d = aggregateIdeology2DFromItems([...extractedSegments, ...extractedKeyStatements]);
-  }
-
-  return {
-    ideology_2d: ideology2d,
-    evidence_counts,
-    total_evidence,
-    analysis_summary: summary,
-    speech_data: speechData,
-    raw_analysis: root,
-  };
-};
-
 const Transcript = ({ speech, transcriptText }) => {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
-  const containerRef = useRef(null);
 
   const text = (transcriptText || "").trim();
   const wordCount = useMemo(() => (text ? text.split(/\s+/).filter(Boolean).length : 0), [text]);
@@ -2399,12 +2175,7 @@ const Transcript = ({ speech, transcriptText }) => {
           </div>
 
           <div className="flex items-center gap-2">
-            <button
-              onClick={copyTranscript}
-              disabled={!text}
-              className="px-4 py-2.5 bg-gray-800/50 hover:bg-gray-700/50 disabled:opacity-50 text-gray-300 hover:text-white rounded-xl border border-gray-700/50 transition-all flex items-center gap-2"
-              type="button"
-            >
+            <button onClick={copyTranscript} disabled={!text} className="px-4 py-2.5 bg-gray-800/50 hover:bg-gray-700/50 disabled:opacity-50 text-gray-300 hover:text-white rounded-xl border border-gray-700/50 transition-all flex items-center gap-2" type="button">
               {copied ? (
                 <>
                   <Check className="w-4 h-4 text-emerald-300" />
@@ -2418,12 +2189,7 @@ const Transcript = ({ speech, transcriptText }) => {
               )}
             </button>
 
-            <button
-              onClick={downloadTranscriptFile}
-              disabled={!text}
-              className="px-4 py-2.5 bg-gradient-to-r from-cyan-600/80 to-blue-600/80 hover:from-cyan-500 hover:to-blue-500 text-white rounded-xl transition-all flex items-center gap-2"
-              type="button"
-            >
+            <button onClick={downloadTranscriptFile} disabled={!text} className="px-4 py-2.5 bg-gradient-to-r from-cyan-600/80 to-blue-600/80 hover:from-cyan-500 hover:to-blue-500 text-white rounded-xl transition-all flex items-center gap-2" type="button">
               <Download className="w-4 h-4" />
               Export
             </button>
@@ -2440,7 +2206,7 @@ const Transcript = ({ speech, transcriptText }) => {
             </div>
           </div>
         ) : (
-          <div ref={containerRef} className={`h-full overflow-y-auto p-6 ${expanded ? "" : "max-h-96"}`}>
+          <div className={`h-full overflow-y-auto p-6 ${expanded ? "" : "max-h-96"}`}>
             <p className="text-gray-300 text-sm leading-relaxed whitespace-pre-wrap">{text}</p>
           </div>
         )}
@@ -2448,11 +2214,7 @@ const Transcript = ({ speech, transcriptText }) => {
 
       {text && text.length > 1500 ? (
         <div className="p-4 border-t border-gray-700/50">
-          <button
-            onClick={() => setExpanded(!expanded)}
-            className="w-full py-3 bg-gradient-to-r from-gray-800/50 to-gray-900/50 hover:from-gray-700/50 hover:to-gray-800/50 border border-gray-700/50 rounded-xl text-gray-300 hover:text-white transition-all flex items-center justify-center gap-3"
-            type="button"
-          >
+          <button onClick={() => setExpanded(!expanded)} className="w-full py-3 bg-gradient-to-r from-gray-800/50 to-gray-900/50 hover:from-gray-700/50 hover:to-gray-800/50 border border-gray-700/50 rounded-xl text-gray-300 hover:text-white transition-all flex items-center justify-center gap-3" type="button">
             {expanded ? (
               <>
                 <ChevronUp className="w-5 h-5" />
@@ -2471,16 +2233,18 @@ const Transcript = ({ speech, transcriptText }) => {
   );
 };
 
+/* ----------------------------- Page Logic ----------------------------- */
+
 const AnalysisPage = () => {
   const { id } = useParams();
   const navigate = useNavigate();
 
   const [speech, setSpeech] = useState(null);
-  const [overview, setOverview] = useState(null);
   const [segments, setSegments] = useState([]);
   const [keyStatements, setKeyStatements] = useState([]);
   const [argumentUnits, setArgumentUnits] = useState([]);
   const [analysisSummary, setAnalysisSummary] = useState(null);
+  const [ideology2d, setIdeology2d] = useState(null);
   const [rawAnalysis, setRawAnalysis] = useState(null);
 
   const [loading, setLoading] = useState(true);
@@ -2502,18 +2266,15 @@ const AnalysisPage = () => {
   const [animationsEnabled, setAnimationsEnabled] = useState(true);
   const [autoplayOnJump, setAutoplayOnJump] = useState(true);
 
-  const transcriptText =
-    speech?.text ??
-    speech?.transcript_text ??
-    speech?.transcript ??
-    speech?.full_text ??
-    "";
+  const transcriptText = speech?.text ?? speech?.transcript_text ?? speech?.transcript ?? speech?.full_text ?? "";
 
   const hasMedia = Boolean(speech?.media_url);
-  const mediaUrl = hasMedia ? toAbsoluteUrl(speech?.media_url) : null;
+  const mediaUrl = useMemo(() => (hasMedia ? toAbsoluteUrl(speech?.media_url) : null), [hasMedia, speech?.media_url]);
 
-  const mediaLower = String(speech?.media_url || "").toLowerCase();
-  const isVideo = Boolean(mediaLower.includes(".mp4") || mediaLower.includes(".webm") || mediaLower.includes(".mov") || mediaLower.includes(".mkv"));
+  const isVideo = useMemo(() => {
+    const mediaLower = String(speech?.media_url || "").toLowerCase();
+    return Boolean(mediaLower.includes(".mp4") || mediaLower.includes(".webm") || mediaLower.includes(".mov") || mediaLower.includes(".mkv"));
+  }, [speech?.media_url]);
 
   const fetchAnalysisWithFallback = useCallback(
     async ({ mediaDurationSeconds } = {}) => {
@@ -2521,18 +2282,42 @@ const AnalysisPage = () => {
         Number.isFinite(mediaDurationSeconds) && Number(mediaDurationSeconds) > 0
           ? { media_duration_seconds: Number(mediaDurationSeconds) }
           : {};
-
       try {
         return await getAnalysis(id, opts);
       } catch {}
-
       try {
         return await getAnalysisLegacy(id, opts);
       } catch {}
-
       return null;
     },
     [id]
+  );
+
+  const hydrateFromAnalysis = useCallback(
+    (analysisDataRaw, speechDataForContext) => {
+      const root = getAnalysisRoot(analysisDataRaw);
+      const analysisData = getAnalysisRoot(root);
+
+      setRawAnalysis(analysisData);
+
+      const segs = extractSegments(analysisData);
+      const ks = extractKeyStatements(analysisData);
+      const aus = extractArgumentUnits(analysisData);
+
+      setSegments(segs);
+      setKeyStatements(ks);
+      setArgumentUnits(aus);
+
+      const summary = extractAnalysisSummary(analysisData, { segments: segs, keyStatements: ks, argumentUnits: aus });
+      setAnalysisSummary(summary);
+
+      const segmentCounts = computeFamilyCounts(segs);
+      const backend2d = analysisData?.ideology_2d || analysisData?.speech_level?.ideology_2d || analysisData?.metadata?.ideology_2d || null;
+      setIdeology2d(buildIdeology2D(segmentCounts, backend2d));
+
+      if (speechDataForContext) setSpeech(speechDataForContext);
+    },
+    []
   );
 
   useEffect(() => {
@@ -2541,6 +2326,7 @@ const AnalysisPage = () => {
     setCurrentTime(0);
     setIsPlaying(false);
     setActiveFilter(null);
+    setError("");
     if (mediaRef.current) {
       try {
         mediaRef.current.pause();
@@ -2570,22 +2356,7 @@ const AnalysisPage = () => {
         if (!alive) return;
         if (!analysisDataRaw) throw new Error("No analysis returned");
 
-        const analysisData = getAnalysisRoot(analysisDataRaw);
-        setRawAnalysis(analysisData);
-
-        const segs = extractSegments(analysisData);
-        const ks = extractKeyStatements(analysisData);
-        const aus = extractArgumentUnits(analysisData);
-
-        setSegments(segs);
-        setKeyStatements(ks);
-        setArgumentUnits(aus);
-
-        const summary = extractAnalysisSummary(analysisData, { segments: segs, keyStatements: ks, argumentUnits: aus });
-        setAnalysisSummary(summary);
-
-        const nextOverview = buildOverviewFromAnalysis(speechData, analysisData);
-        setOverview(nextOverview);
+        hydrateFromAnalysis(analysisDataRaw, speechData || null);
       } catch (e) {
         if (!alive) return;
         setError(String(e?.message || e || "Unknown error"));
@@ -2599,7 +2370,7 @@ const AnalysisPage = () => {
     return () => {
       alive = false;
     };
-  }, [id, fetchAnalysisWithFallback]);
+  }, [id, fetchAnalysisWithFallback, hydrateFromAnalysis]);
 
   useEffect(() => {
     let alive = true;
@@ -2610,25 +2381,8 @@ const AnalysisPage = () => {
       try {
         const analysisDataRaw = await fetchAnalysisWithFallback({ mediaDurationSeconds: duration });
         if (!alive || !analysisDataRaw) return;
-
         durationEnrichedRef.current = true;
-
-        const analysisData = getAnalysisRoot(analysisDataRaw);
-        setRawAnalysis(analysisData);
-
-        const segs = extractSegments(analysisData);
-        const ks = extractKeyStatements(analysisData);
-        const aus = extractArgumentUnits(analysisData);
-
-        setSegments(segs);
-        setKeyStatements(ks);
-        setArgumentUnits(aus);
-
-        const summary = extractAnalysisSummary(analysisData, { segments: segs, keyStatements: ks, argumentUnits: aus });
-        setAnalysisSummary(summary);
-
-        const nextOverview = buildOverviewFromAnalysis(speech, analysisData);
-        setOverview(nextOverview);
+        hydrateFromAnalysis(analysisDataRaw, speech);
       } catch {}
     };
 
@@ -2636,7 +2390,7 @@ const AnalysisPage = () => {
     return () => {
       alive = false;
     };
-  }, [duration, speech, fetchAnalysisWithFallback]);
+  }, [duration, speech, fetchAnalysisWithFallback, hydrateFromAnalysis]);
 
   const jumpToTime = useCallback(
     async (t, opts = {}) => {
@@ -2666,32 +2420,16 @@ const AnalysisPage = () => {
     setIsReanalyzing(true);
     try {
       await reanalyzeSpeechSafe(id, { force: true });
-
       const analysisDataRaw = await fetchAnalysisWithFallback({ mediaDurationSeconds: duration });
-      const data = getAnalysisRoot(analysisDataRaw);
-      if (!data || typeof data !== "object") throw new Error("No analysis returned after re-analyze.");
-
-      setRawAnalysis(data);
-
-      const segs = extractSegments(data);
-      const ks = extractKeyStatements(data);
-      const aus = extractArgumentUnits(data);
-
-      setSegments(segs);
-      setKeyStatements(ks);
-      setArgumentUnits(aus);
-
-      const summary = extractAnalysisSummary(data, { segments: segs, keyStatements: ks, argumentUnits: aus });
-      setAnalysisSummary(summary);
-
-      const nextOverview = buildOverviewFromAnalysis(speech, data);
-      setOverview(nextOverview);
+      if (!analysisDataRaw) throw new Error("No analysis returned after re-analyze.");
+      hydrateFromAnalysis(analysisDataRaw, speech);
     } catch (e) {
       console.error("Re-analyze failed:", e);
+      setError(String(e?.message || e || "Re-analyze failed"));
     } finally {
       setIsReanalyzing(false);
     }
-  }, [id, duration, speech, fetchAnalysisWithFallback]);
+  }, [id, duration, speech, fetchAnalysisWithFallback, hydrateFromAnalysis]);
 
   const exportTranscript = () => {
     const text = String(transcriptText || "").trim();
@@ -2702,7 +2440,7 @@ const AnalysisPage = () => {
   const exportAnalysisJson = () => {
     downloadJsonFile(`${(speech?.title || "analysis").replace(/[^\w\-]+/g, "_")}.analysis.json`, {
       speech,
-      overview,
+      ideology_2d: ideology2d,
       segments,
       key_statements: keyStatements,
       argument_units: argumentUnits,
@@ -2721,7 +2459,7 @@ const AnalysisPage = () => {
 
   const onBack = () => navigate("/dashboard");
 
-  const distributionEvidence = useMemo(() => dedupeEvidence([...(segments || []), ...(keyStatements || [])]), [segments, keyStatements]);
+  const distributionEvidence = useMemo(() => dedupeEvidence(segments || []), [segments]);
 
   if (loading) return <LoadingScreen />;
   if (error) return <ErrorScreen error={error} onBack={onBack} />;
@@ -2740,7 +2478,7 @@ const AnalysisPage = () => {
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
         <AnalysisSummaryStats summary={analysisSummary} keyStatements={keyStatements} />
 
-        <DominantClassificationCard overview={overview} showMap={showMap} animationsEnabled={animationsEnabled} />
+        <DominantClassificationCard ideology2d={ideology2d} showMap={showMap} animationsEnabled={animationsEnabled} />
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <div className="space-y-6 h-full">
@@ -2772,26 +2510,41 @@ const AnalysisPage = () => {
           <Transcript speech={speech} transcriptText={transcriptText} />
         </div>
 
-        <EvidenceDistribution overview={overview} segments={distributionEvidence} activeFilter={activeFilter} setActiveFilter={setActiveFilter} />
+        {/* ✅ FIX: pass ideology2d so EvidenceDistribution can use axis_strengths */}
+        <EvidenceDistribution
+          summary={analysisSummary}
+          segments={distributionEvidence}
+          activeFilter={activeFilter}
+          setActiveFilter={setActiveFilter}
+          ideology2d={ideology2d}
+        />
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <KeyStatements
-            statements={keyStatements}
+          <EvidenceList
+            title="Key Statements"
+            icon={Sparkles}
+            items={keyStatements}
             activeFilter={activeFilter}
             onClearFilter={() => setActiveFilter(null)}
             onJumpToTime={jumpToTime}
             transcriptText={transcriptText}
+            searchable={false}
+            prefix="K"
           />
           <QuestionGenerator speechId={id} />
         </div>
 
         <div className="col-span-full">
-          <EvidenceSegments
-            segments={segments}
+          <EvidenceList
+            title="Evidence Segments"
+            icon={Layers}
+            items={segments}
             activeFilter={activeFilter}
             onClearFilter={() => setActiveFilter(null)}
             onJumpToTime={jumpToTime}
             transcriptText={transcriptText}
+            searchable
+            prefix="#"
           />
         </div>
       </div>
@@ -2829,11 +2582,7 @@ const AnalysisPage = () => {
           </div>
 
           <div className="flex justify-end">
-            <button
-              onClick={() => setSettingsOpen(false)}
-              className="px-5 py-2.5 bg-gray-800/50 hover:bg-gray-700/50 text-gray-200 rounded-xl border border-gray-700/50 transition"
-              type="button"
-            >
+            <button onClick={() => setSettingsOpen(false)} className="px-5 py-2.5 bg-gray-800/50 hover:bg-gray-700/50 text-gray-200 rounded-xl border border-gray-700/50 transition" type="button">
               Close
             </button>
           </div>
@@ -2878,11 +2627,7 @@ const AnalysisPage = () => {
           </div>
 
           <div className="flex justify-end">
-            <button
-              onClick={() => setExportOpen(false)}
-              className="px-5 py-2.5 bg-gray-800/50 hover:bg-gray-700/50 text-gray-200 rounded-xl border border-gray-700/50 transition"
-              type="button"
-            >
+            <button onClick={() => setExportOpen(false)} className="px-5 py-2.5 bg-gray-800/50 hover:bg-gray-700/50 text-gray-200 rounded-xl border border-gray-700/50 transition" type="button">
               Close
             </button>
           </div>

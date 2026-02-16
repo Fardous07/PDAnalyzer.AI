@@ -547,6 +547,9 @@ export async function uploadSpeech({
   is_public = false,
   llm_provider = "openai",
   llm_model = "gpt-4o-mini",
+  party,
+  role,
+  use_research_analysis = false,
 } = {}) {
   try {
     if (!file) throw new Error("Missing file");
@@ -565,6 +568,11 @@ export async function uploadSpeech({
     form.append("is_public", String(Boolean(is_public)));
     if (llm_provider) form.append("llm_provider", llm_provider);
     if (llm_model) form.append("llm_model", llm_model);
+    
+    // Research analysis fields
+    if (party) form.append("party", party);
+    if (role) form.append("role", role);
+    form.append("use_research_analysis", String(Boolean(use_research_analysis)));
 
     const res = await uploadClient.post("/api/speeches/upload", form);
     return unwrapResponse(res.data);
@@ -807,6 +815,9 @@ export async function uploadSpeechWithPolling({
   llmProvider = "openai",
   llmModel = "gpt-4o-mini",
   isPublic = false,
+  party = "",
+  role = "",
+  useResearchAnalysis = false,
   onProgress,
   pollIntervalMs = 2500,
   timeoutMs = 20 * 60 * 1000,
@@ -827,6 +838,11 @@ export async function uploadSpeechWithPolling({
     form.append("is_public", String(Boolean(isPublic)));
     form.append("llm_provider", llmProvider);
     form.append("llm_model", llmModel);
+    
+    // Research analysis fields
+    if (party) form.append("party", party);
+    if (role) form.append("role", role);
+    form.append("use_research_analysis", String(Boolean(useResearchAnalysis)));
 
     onProgress?.("Preparing upload…", 1);
 

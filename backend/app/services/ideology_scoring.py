@@ -1,5 +1,3 @@
-# backend/app/services/ideology_scoring.py
-
 from __future__ import annotations
 
 import logging
@@ -25,7 +23,21 @@ class ConfidenceCalibrator(Protocol):
     def calibrate_axis(self, raw_confidence: float, axis: str) -> float: ...
 
 
-_CALIBRATOR: Optional[ConfidenceCalibrator] = None
+def _initialize_calibrator() -> Optional[ConfidenceCalibrator]:
+    try:
+        from app.services.evaluation.calibrate import ConfidenceCalibrator as _Impl
+        calibrator = _Impl()
+        logger.info("Confidence calibrator initialized successfully")
+        return calibrator
+    except ImportError:
+        logger.warning("Calibrator module not available, using raw confidences")
+        return None
+    except Exception as e:
+        logger.warning(f"Could not initialize calibrator: {e}")
+        return None
+
+
+_CALIBRATOR: Optional[ConfidenceCalibrator] = _initialize_calibrator()
 
 
 def configure_calibrator(calibrator: Optional[ConfidenceCalibrator]) -> None:
@@ -55,7 +67,7 @@ def _calibrate_axis(raw: float, axis: str) -> float:
         return float(raw)
 
 
-DEFAULT_CODE_THRESHOLD = 0.60
+DEFAULT_CODE_THRESHOLD = 0.25
 DEFAULT_USE_SEMANTIC = True
 
 RESEARCH_GRADE_MIN_CONF = 0.65
@@ -123,7 +135,6 @@ def _norm_family_label(label: Any) -> str:
         return CENTRIST_FAMILY
     key = re.sub(r"[\s\-]+", "_", raw.lower()).strip("_")
     mapped = _FAMILY_ALIASES.get(key, raw)
-
     if mapped in IDEOLOGY_FAMILIES or mapped == CENTRIST_FAMILY:
         return mapped
     return CENTRIST_FAMILY
@@ -270,7 +281,10 @@ def _normalize_2d_payload(block: Any) -> Dict[str, Any]:
 
     raw_social = _clamp01(c2d.get("social", 0.0))
     raw_econ = _clamp01(c2d.get("economic", 0.0))
-    raw_overall = _clamp01(c2d.get("overall", 0.0))
+    if "overall" in c2d:
+        raw_overall = _clamp01(c2d.get("overall", 0.0))
+    else:
+        raw_overall = _clamp01((raw_social + raw_econ) / 2.0)
 
     cal_social = _clamp01(_calibrate_axis(raw_social, axis="social"))
     cal_econ = _clamp01(_calibrate_axis(raw_econ, axis="economic"))
@@ -462,7 +476,7 @@ def score_text(
         evidence_count = len(evidence)
 
     marpor_codes = [str(x).strip() for x in _as_list(res.get("marpor_codes", [])) if str(x).strip()]
-    if not marpor_codes:
+    if not marpor_codes and evidence:
         seen = set()
         for ev in evidence:
             code = str(ev.get("code", "") or "").strip()
@@ -470,7 +484,7 @@ def score_text(
                 seen.add(code)
                 marpor_codes.append(code)
 
-    raw_confidence = _clamp01(res.get("confidence_score", 0.0))
+    raw_confidence = _clamp01(res.get("raw_confidence_score", res.get("confidence_score", 0.0)))
     calibrated_confidence = _clamp01(_calibrate_overall(raw_confidence))
 
     signal_strength = float(_as_float(res.get("signal_strength", 0.0), 0.0))
@@ -484,7 +498,13 @@ def score_text(
         is_ideology_evidence = False
         is_ideology_evidence_2d = False
 
-    total_strength = float(_as_float(res.get("total_evidence_strength", 0.0), 0.0))
+    total_strength = float(
+        _as_float(
+            res.get("total_strength", res.get("total_evidence_strength", 0.0)),
+            0.0,
+        )
+    )
+
     ideology_2d = _normalize_2d_payload(res.get("ideology_2d"))
 
     if ideology_family in IDEOLOGY_FAMILIES and not is_ideology_evidence_2d:
@@ -496,15 +516,19 @@ def score_text(
 
     marpor_breakdown = res.get("marpor_breakdown")
     if not isinstance(marpor_breakdown, dict):
-        marpor_breakdown = calculate_marpor_breakdown(evidence, hybrid_marpor_analyzer.categories)
+        marpor_breakdown = calculate_marpor_breakdown(evidence, getattr(hybrid_marpor_analyzer, "categories", {}))
 
     marpor_code_analysis = res.get("marpor_code_analysis")
     if not isinstance(marpor_code_analysis, dict):
         marpor_code_analysis = dict(marpor_breakdown)
 
-    ev_conf_block = _as_dict(res.get("evidence_level_confidence"))
-    pat = _as_dict(ev_conf_block.get("pattern_confidence"))
-    pattern_confidence = float(_as_float(pat.get("pattern_confidence", 0.0), 0.0))
+    pattern_confidence = _as_float(res.get("pattern_confidence", None), None)
+    if pattern_confidence is None:
+        ev_conf_block = _as_dict(res.get("evidence_level_confidence"))
+        pat = _as_dict(ev_conf_block.get("pattern_confidence"))
+        pattern_confidence = float(_as_float(pat.get("pattern_confidence", 0.0), 0.0))
+    else:
+        pattern_confidence = float(_as_float(pattern_confidence, 0.0))
 
     attribution_risk_summary = _summarize_attribution_risk(evidence)
     attribution_risk = bool(attribution_risk_summary.get("is_risky", False))
@@ -514,7 +538,7 @@ def score_text(
             is_ideology_evidence
             and calibrated_confidence >= RESEARCH_GRADE_MIN_CONF
             and evidence_count >= RESEARCH_GRADE_MIN_EVIDENCE
-            and pattern_confidence >= RESEARCH_GRADE_MIN_PATTERN_SOCIAL
+            and float(pattern_confidence) >= RESEARCH_GRADE_MIN_PATTERN_SOCIAL
             and not attribution_risk
         )
     elif ideology_family in (ECON_LEFT, ECON_RIGHT):

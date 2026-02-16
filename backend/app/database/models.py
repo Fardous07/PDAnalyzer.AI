@@ -17,6 +17,8 @@ from sqlalchemy import (
     Table,
     Text,
     UniqueConstraint,
+    false,
+    true,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.mutable import MutableDict, MutableList
@@ -96,11 +98,15 @@ class Speech(Base):
     llm_provider = Column(String(50), nullable=True)
     llm_model = Column(String(100), nullable=True)
 
-    use_semantic_segmentation = Column(Boolean, default=True, nullable=False)
-    use_semantic_scoring = Column(Boolean, default=True, nullable=False)
+    party = Column(String(100), nullable=True)
+    role = Column(String(100), nullable=True)
+
+    use_semantic_segmentation = Column(Boolean, default=True, nullable=False, server_default=true())
+    use_semantic_scoring = Column(Boolean, default=True, nullable=False, server_default=true())
+    use_research_analysis = Column(Boolean, default=False, nullable=False, server_default=false())
 
     status = Column(String(20), default="pending", nullable=False)
-    is_public = Column(Boolean, default=False, nullable=False)
+    is_public = Column(Boolean, default=False, nullable=False, server_default=false())
 
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -164,10 +170,7 @@ class Analysis(Base):
         CheckConstraint("authoritarian_score >= 0 AND authoritarian_score <= 100", name="check_auth_score"),
         CheckConstraint("centrist_score >= 0 AND centrist_score <= 100", name="check_centrist_score"),
         CheckConstraint("confidence_score >= 0 AND confidence_score <= 1", name="check_confidence"),
-        CheckConstraint(
-            "(ideology_family <> 'Centrist') OR (ideology_subtype IS NULL)",
-            name="check_centrist_no_subtype",
-        ),
+        CheckConstraint("(ideology_family <> 'Centrist') OR (ideology_subtype IS NULL)", name="check_centrist_no_subtype"),
     )
 
     def __repr__(self) -> str:
@@ -286,10 +289,7 @@ class AnalysisHistory(Base):
         CheckConstraint("authoritarian_score >= 0 AND authoritarian_score <= 100", name="check_history_auth_score"),
         CheckConstraint("centrist_score >= 0 AND centrist_score <= 100", name="check_history_centrist_score"),
         CheckConstraint("confidence_score >= 0 AND confidence_score <= 1", name="check_history_confidence"),
-        CheckConstraint(
-            "(ideology_family <> 'Centrist') OR (ideology_subtype IS NULL)",
-            name="check_history_centrist_no_subtype",
-        ),
+        CheckConstraint("(ideology_family <> 'Centrist') OR (ideology_subtype IS NULL)", name="check_history_centrist_no_subtype"),
     )
 
     def __repr__(self) -> str:
